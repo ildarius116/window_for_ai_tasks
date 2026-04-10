@@ -43,7 +43,8 @@
       "mcp__claude_ai_Context7__query-docs",
       "Skill(update-config)",
       "Skill(statusline)",
-      "Bash(bash ~/.claude/statusline-command.sh)"
+      "Bash(bash ~/.claude/statusline-command.sh)",
+      "Bash(awk '{print $NF}')"
     ]
   }
 }

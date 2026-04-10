@@ -126,7 +126,9 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-mws}:${POSTGRES_PASSWORD}@postgres:5432/memory
       LITELLM_URL: http://litellm:4000
       LITELLM_API_KEY: ${LITELLM_MASTER_KEY}
-      EXTRACTION_MODEL: mws/nemotron
+      EMBEDDING_MODEL: mws/bge-m3
+      EMBEDDING_DIMENSIONS: "1024"
+      EXTRACTION_MODEL: mws/gpt-alpha
     depends_on:
       postgres:
         condition: service_healthy

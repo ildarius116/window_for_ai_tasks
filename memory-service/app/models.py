@@ -5,6 +5,8 @@ from pgvector.sqlalchemy import Vector
 from sqlalchemy import DateTime, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from app.config import EMBEDDING_DIMENSIONS
+
 
 class Base(DeclarativeBase):
     pass
@@ -18,7 +20,7 @@ class Memory(Base):
     )
     user_id: Mapped[str] = mapped_column(String(255), index=True)
     content: Mapped[str] = mapped_column(Text)
-    embedding = mapped_column(Vector(768), nullable=True)
+    embedding = mapped_column(Vector(EMBEDDING_DIMENSIONS), nullable=True)
     source_chat_id: Mapped[str | None] = mapped_column(
         String(255), nullable=True
     )
