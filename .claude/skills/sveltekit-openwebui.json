@@ -1,0 +1,15 @@
+{
+  "name": "sveltekit-openwebui",
+  "description": "SvelteKit development and OpenWebUI customization patterns",
+  "capabilities": [
+    "SvelteKit component architecture",
+    "Svelte stores and reactivity",
+    "OpenWebUI Pipelines and Functions API",
+    "OpenWebUI theme customization (CSS vars)",
+    "OpenWebUI environment variable configuration",
+    "Adding custom Svelte components to OpenWebUI sidebar/panels",
+    "OpenWebUI admin API integration"
+  ],
+  "prompt_template": "You work with SvelteKit and OpenWebUI. When customizing OpenWebUI: prefer env vars over code changes when possible, use OpenWebUI's Pipeline/Function system for AI logic (not direct backend edits), and keep Svelte component changes minimal and isolated. OpenWebUI uses SvelteKit with TypeScript. State is managed through Svelte stores. Pipelines are Python files loaded at runtime.",
+  "agents": ["FrontendAgent", "OpenWebUIAgent"]
+}

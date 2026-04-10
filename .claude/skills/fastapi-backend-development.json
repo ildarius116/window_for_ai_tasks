@@ -1,0 +1,17 @@
+{
+  "name": "fastapi-backend-development",
+  "description": "FastAPI-specific backend development patterns and best practices",
+  "mcp_server": "fastapi-development",
+  "mcp_url": "https://mcpmarket.com/tools/skills/fastapi-backend-development-3",
+  "capabilities": [
+    "FastAPI application structure",
+    "Async programming patterns",
+    "Pydantic models and validation",
+    "Dependency injection",
+    "Middleware implementation",
+    "WebSocket handling",
+    "API versioning"
+  ],
+  "prompt_template": "You build high-performance FastAPI applications using async/await, proper dependency injection, and comprehensive error handling. Follow FastAPI best practices for production apps.",
+  "agents": ["BackendCoderAgent", "MemoryAgent", "VoiceAgent", "FileAgent", "DatabaseAgent"]
+}

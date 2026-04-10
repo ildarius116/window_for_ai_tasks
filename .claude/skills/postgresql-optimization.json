@@ -1,0 +1,16 @@
+{
+  "name": "postgresql-optimization",
+  "description": "PostgreSQL performance tuning and optimization techniques",
+  "mcp_server": "postgresql-optimization",
+  "mcp_url": "https://mcpmarket.com/tools/skills/postgresql-performance",
+  "capabilities": [
+    "Query optimization",
+    "Index strategies",
+    "Connection pooling",
+    "VACUUM and ANALYZE",
+    "Partitioning",
+    "pgvector optimization"
+  ],
+  "prompt_template": "You optimize PostgreSQL databases for performance. Analyze queries with EXPLAIN, create effective indexes, configure connection pooling, and tune postgresql.conf.",
+  "agents": ["DatabaseAgent", "ReviewerAgent"]
+}

@@ -1,0 +1,253 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    # Port not exposed to host — accessible only via mws-network
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-mws}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-openwebui}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-databases.sql:/docker-entrypoint-initdb.d/init-databases.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mws} -d ${POSTGRES_DB:-openwebui}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - mws-network
+
+  redis:
+    image: redis:7-alpine
+    # Port not exposed to host — accessible only via mws-network
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - mws-network
+
+  litellm:
+    build:
+      context: ./litellm
+      dockerfile: Dockerfile
+    # Port not exposed to host — accessible only via mws-network
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      QWEN_API_KEY: ${QWEN_API_KEY}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      LITELLM_DATABASE_URL: postgresql://${POSTGRES_USER:-mws}:${POSTGRES_PASSWORD}@postgres:5432/litellm
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-http://langfuse:3000}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness')"]
+      interval: 30s
+      timeout: 15s
+      retries: 10
+      start_period: 120s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - mws-network
+
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:main
+    # Port exposed for direct access (bypass nginx); remove in production
+    ports: ["3000:8080"]
+    environment:
+      OPENAI_API_BASE_URLS: http://litellm:4000/v1
+      OPENAI_API_KEYS: ${LITELLM_MASTER_KEY}
+      WEBUI_SECRET_KEY: ${OPENWEBUI_SECRET_KEY}
+      WEBUI_NAME: "MWS GPT"
+      DATABASE_URL: postgresql://${POSTGRES_USER:-mws}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-openwebui}
+      ENABLE_SIGNUP: "true"
+      ENABLE_LOGIN_FORM: "true"
+      WEBUI_AUTH: "true"
+      DEFAULT_MODELS: "mws-auto"
+      ENABLE_OLLAMA_API: "false"
+      RAG_EMBEDDING_ENGINE: ""
+      RAG_EMBEDDING_MODEL: "sentence-transformers/all-MiniLM-L6-v2"
+      CHUNK_SIZE: "1500"
+      CHUNK_OVERLAP: "100"
+      RAG_TOP_K: "5"
+      AUDIO_STT_ENGINE: ""
+      WHISPER_MODEL: "base"
+      AUDIO_TTS_ENGINE: "openai"
+      AUDIO_TTS_OPENAI_API_BASE_URL: "http://tts-service:8000/v1"
+      AUDIO_TTS_OPENAI_API_KEY: "sk-placeholder"
+      AUDIO_TTS_MODEL: "tts-1"
+      AUDIO_TTS_VOICE: "alloy"
+    volumes:
+      - openwebui_data:/app/backend/data
+      - ./openwebui/static/custom.css:/app/backend/open_webui/static/custom.css:ro
+      - ./openwebui/static/custom.css:/app/build/static/custom.css:ro
+    depends_on:
+      litellm:
+        condition: service_healthy
+      tts-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 15s
+      retries: 10
+      start_period: 120s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - mws-network
+
+  memory-service:
+    build: ./memory-service
+    # Port not exposed to host — accessible only via mws-network
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-mws}:${POSTGRES_PASSWORD}@postgres:5432/memory
+      LITELLM_URL: http://litellm:4000
+      LITELLM_API_KEY: ${LITELLM_MASTER_KEY}
+      EXTRACTION_MODEL: mws/nemotron
+    depends_on:
+      postgres:
+        condition: service_healthy
+      litellm:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - mws-network
+
+  tts-service:
+    build: ./tts-service
+    # Port not exposed to host — accessible only via mws-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - mws-network
+
+  langfuse:
+    image: langfuse/langfuse:2
+    # Port not exposed to host — accessible only via mws-network
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-mws}:${POSTGRES_PASSWORD}@postgres:5432/langfuse
+      NEXTAUTH_URL: http://localhost:3001
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET}
+      SALT: ${LANGFUSE_SALT}
+      HOSTNAME: "0.0.0.0"
+      TELEMETRY_ENABLED: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://0.0.0.0:3000/api/public/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - mws-network
+
+  prometheus:
+    image: prom/prometheus:latest
+    # Port not exposed to host — accessible only via mws-network
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=30d"
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    networks:
+      - mws-network
+
+  grafana:
+    image: grafana/grafana:latest
+    ports: ["3002:3000"]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_SERVER_ROOT_URL: http://localhost:3002
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - mws-network
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      # - "443:443"  # Uncomment when HTTPS is enabled
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      # - ./nginx/ssl:/etc/nginx/ssl:ro  # Uncomment for HTTPS certificates
+    depends_on:
+      - openwebui
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+      - /var/cache/nginx
+      - /var/run
+    networks:
+      - mws-network
+
+networks:
+  mws-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  openwebui_data:
+  prometheus_data:
+  grafana_data:

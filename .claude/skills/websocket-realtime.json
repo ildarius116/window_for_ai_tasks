@@ -1,0 +1,16 @@
+{
+  "name": "websocket-realtime",
+  "description": "WebSocket implementation for real-time streaming",
+  "mcp_server": "websocket-realtime",
+  "mcp_url": "https://mcpmarket.com/tools/skills/websocket-streaming",
+  "capabilities": [
+    "WebSocket connection handling",
+    "Real-time message streaming",
+    "Bi-directional communication",
+    "Connection state management",
+    "Reconnection handling",
+    "Audio/video streaming"
+  ],
+  "prompt_template": "You implement robust WebSocket connections for real-time features. Handle connection lifecycle, streaming data, errors, and reconnections. Use async for high concurrency.",
+  "agents": ["VoiceAgent", "FrontendAgent"]
+}

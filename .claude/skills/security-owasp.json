@@ -1,0 +1,17 @@
+{
+  "name": "security-owasp",
+  "description": "Security best practices based on OWASP Top 10",
+  "mcp_server": "security-owasp",
+  "mcp_url": "https://mcpmarket.com/tools/skills/security-best-practices",
+  "capabilities": [
+    "Authentication security",
+    "Input validation",
+    "SQL injection prevention",
+    "XSS protection",
+    "CSRF mitigation",
+    "Secrets management",
+    "HTTPS configuration"
+  ],
+  "prompt_template": "You implement security controls following OWASP Top 10. Protect against injection, broken authentication, XSS, and ensure secure configuration. Never hardcode secrets.",
+  "agents": ["SecurityAgent", "ReviewerAgent"]
+}

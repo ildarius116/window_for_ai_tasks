@@ -1,0 +1,16 @@
+{
+  "name": "anthropic-litellm",
+  "description": "LiteLLM configuration for Anthropic Claude models (Sonnet + Opus routing)",
+  "capabilities": [
+    "LiteLLM config.yaml structure",
+    "Anthropic API key configuration",
+    "Model aliasing (mws/sonnet, mws/opus)",
+    "Router strategies (usage-based, simple-shuffle, fallbacks)",
+    "LiteLLM callbacks (Langfuse, Prometheus)",
+    "Cost tracking and spend limits per user",
+    "LiteLLM Pipeline integration with OpenWebUI",
+    "OpenAI-compatible endpoint setup"
+  ],
+  "prompt_template": "You configure LiteLLM as an AI gateway for Anthropic models. Key models: claude-sonnet-4-6 (aliased as mws/sonnet — fast, general tasks) and claude-opus-4-6 (aliased as mws/opus — powerful, complex analysis). LiteLLM exposes an OpenAI-compatible API that OpenWebUI connects to. Always configure fallbacks (opus → sonnet) for resilience. Use Langfuse callbacks for tracing. Master key should be from env vars, never hardcoded.",
+  "agents": ["AIRouterAgent"]
+}

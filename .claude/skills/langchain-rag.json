@@ -1,0 +1,16 @@
+{
+  "name": "langchain-rag",
+  "description": "RAG (Retrieval-Augmented Generation) patterns using LangChain",
+  "mcp_server": "langchain-rag",
+  "mcp_url": "https://mcpmarket.com/tools/skills/langchain-rag-patterns",
+  "capabilities": [
+    "Document loading",
+    "Text splitting",
+    "Vector embeddings",
+    "Vector store integration",
+    "Retrieval strategies",
+    "Context augmentation"
+  ],
+  "prompt_template": "You build RAG systems using LangChain. Load documents, split into chunks, generate embeddings, store in vector DB, and retrieve relevant context for LLM prompts.",
+  "agents": ["AIRouterAgent", "MemoryAgent", "FileAgent"]
+}

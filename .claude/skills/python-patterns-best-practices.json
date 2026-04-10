@@ -1,0 +1,16 @@
+{
+  "name": "python-patterns-best-practices",
+  "description": "Python-specific patterns, PEP 8, and best practices",
+  "mcp_server": "python-patterns",
+  "mcp_url": "https://mcpmarket.com/tools/skills/python-patterns-best-practices",
+  "capabilities": [
+    "SOLID and DRY principles",
+    "Type hints and mypy",
+    "Testing strategies (pytest)",
+    "Code organization",
+    "Exception handling",
+    "Performance optimization"
+  ],
+  "prompt_template": "You write clean, maintainable Python code following PEP 8, type hints, and best practices. Apply design patterns appropriately. Ensure code is testable and well-documented.",
+  "agents": ["BackendCoderAgent", "DatabaseAgent", "TesterAgent", "ReviewerAgent", "SecurityAgent", "MemoryAgent", "VoiceAgent", "FileAgent"]
+}

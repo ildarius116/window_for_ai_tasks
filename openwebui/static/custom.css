@@ -1,0 +1,40 @@
+/* MWS GPT Platform — Custom Theme */
+
+:root {
+  --mws-primary: #6366f1;
+  --mws-primary-hover: #4f46e5;
+  --mws-accent: #8b5cf6;
+}
+
+/* Sidebar branding accent */
+#sidebar .bg-gray-50,
+.dark #sidebar .bg-gray-900 {
+  border-left: 3px solid var(--mws-primary);
+}
+
+/* Model selector pill styling */
+.model-selector button {
+  font-weight: 500;
+}
+
+/* Chat input area subtle accent */
+#chat-input-container {
+  border-color: var(--mws-primary) !important;
+  border-width: 1px;
+  border-radius: 1rem;
+}
+
+/* Banner styling */
+.banner {
+  background: linear-gradient(135deg, var(--mws-primary), var(--mws-accent)) !important;
+  color: white !important;
+}
+
+/* Scrollbar styling (dark mode) */
+.dark ::-webkit-scrollbar-thumb {
+  background-color: #4b5563;
+  border-radius: 4px;
+}
+.dark ::-webkit-scrollbar-thumb:hover {
+  background-color: #6b7280;
+}

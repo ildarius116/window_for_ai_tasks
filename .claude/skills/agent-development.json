@@ -1,0 +1,15 @@
+{
+  "name": "agent-development",
+  "description": "Skills for developing and managing AI agents",
+  "mcp_server": "agent-development",
+  "mcp_url": "https://mcpmarket.com/tools/skills/agent-development-1",
+  "capabilities": [
+    "Agent design patterns",
+    "Agent lifecycle management",
+    "Multi-agent coordination",
+    "Agent communication protocols",
+    "Agent state management"
+  ],
+  "prompt_template": "You design and implement intelligent agent systems. Consider agent roles, responsibilities, communication patterns, and error handling.",
+  "agents": ["ArchitectAgent", "DevOpsAgent", "SkillCreatorAgent"]
+}

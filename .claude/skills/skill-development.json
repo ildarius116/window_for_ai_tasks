@@ -1,0 +1,14 @@
+{
+  "name": "skill-development",
+  "description": "Create and configure new agent skills and prompts",
+  "mcp_server": "skill-development",
+  "mcp_url": "https://mcpmarket.com/tools/skills/skill-development-2",
+  "capabilities": [
+    "Skill definition creation",
+    "Prompt engineering",
+    "Skill testing and validation",
+    "Skill documentation"
+  ],
+  "prompt_template": "You design, implement, and document new skills for agents. Create clear, focused skill definitions with effective prompts that achieve specific goals.",
+  "agents": ["SkillCreatorAgent", "AIRouterAgent", "DocsAgent"]
+}

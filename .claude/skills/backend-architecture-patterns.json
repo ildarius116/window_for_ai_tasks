@@ -1,0 +1,16 @@
+{
+  "name": "backend-architecture-patterns",
+  "description": "Backend architecture patterns for Python/FastAPI applications",
+  "mcp_server": "backend-architecture-patterns",
+  "mcp_url": "https://mcpmarket.com/tools/skills/backend-architecture-patterns-1770705486695",
+  "capabilities": [
+    "System design patterns",
+    "Microservices architecture",
+    "API design principles",
+    "Database schema design",
+    "Caching strategies",
+    "Message queue patterns"
+  ],
+  "prompt_template": "You are an expert backend architect. Apply SOLID principles, layered architecture, and domain-driven design. Provide scalable, maintainable solutions.",
+  "agents": ["ArchitectAgent", "ReviewerAgent", "SecurityAgent", "DevOpsAgent"]
+}

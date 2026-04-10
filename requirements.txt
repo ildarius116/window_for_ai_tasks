@@ -1,0 +1,6 @@
+# AI Starter Project Dependencies
+
+# Core dependencies
+
+
+# Development dependencies

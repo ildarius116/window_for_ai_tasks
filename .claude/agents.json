@@ -1,0 +1,77 @@
+[
+  {
+    "name": "ArchitectAgent",
+    "zone_of_responsibility": "Системная архитектура, ADR, C4-диаграммы, принятие технических решений",
+    "skills": ["backend-architecture-patterns", "agent-development"]
+  },
+  {
+    "name": "OpenWebUIAgent",
+    "zone_of_responsibility": "OpenWebUI конфиг, Pipelines/Functions, интеграция companion-сервисов с OpenWebUI, SvelteKit кастомизация",
+    "skills": ["sveltekit-openwebui", "context7-documentation-lookup"]
+  },
+  {
+    "name": "FrontendAgent",
+    "zone_of_responsibility": "SvelteKit компоненты, UI/UX кастомизация OpenWebUI, темизация, добавление новых Svelte компонентов",
+    "skills": ["sveltekit-openwebui", "context7-documentation-lookup"]
+  },
+  {
+    "name": "AIRouterAgent",
+    "zone_of_responsibility": "LiteLLM конфиг, роутинг между claude-sonnet-4-6 и claude-opus-4-6, промпт-инжиниринг, cost tracking, fallback цепочки",
+    "skills": ["anthropic-litellm", "agent-development"]
+  },
+  {
+    "name": "BackendCoderAgent",
+    "zone_of_responsibility": "FastAPI companion microservices (memory-service, file-processor), бизнес-логика, REST API",
+    "skills": ["fastapi-backend-development", "python-patterns-best-practices"]
+  },
+  {
+    "name": "DatabaseAgent",
+    "zone_of_responsibility": "PostgreSQL схема, Alembic миграции, pgvector индексы, оптимизация запросов, семантический поиск",
+    "skills": ["postgresql-optimization", "python-patterns-best-practices"]
+  },
+  {
+    "name": "MemoryAgent",
+    "zone_of_responsibility": "Memory microservice, pgvector хранилище, LLM-powered извлечение фактов из разговоров, дедупликация, инжект в контекст",
+    "skills": ["fastapi-backend-development", "langchain-rag", "python-patterns-best-practices"]
+  },
+  {
+    "name": "VoiceAgent",
+    "zone_of_responsibility": "OpenWebUI STT/TTS конфиг, Whisper интеграция, TTS провайдеры, голосовые пайплайны",
+    "skills": ["python-patterns-best-practices", "fastapi-backend-development"]
+  },
+  {
+    "name": "FileAgent",
+    "zone_of_responsibility": "OpenWebUI RAG настройка, обработка нестандартных форматов (XLS, CSV, аудио, OCR), коллекции знаний",
+    "skills": ["langchain-rag", "python-patterns-best-practices"]
+  },
+  {
+    "name": "DevOpsAgent",
+    "zone_of_responsibility": "docker-compose (OpenWebUI + LiteLLM + companion services), Nginx конфиг, Prometheus/Grafana/Langfuse, health checks, production readiness",
+    "skills": ["docker-compose-patterns", "backend-architecture-patterns"]
+  },
+  {
+    "name": "SecurityAgent",
+    "zone_of_responsibility": "OWASP аудит всех сервисов, Nginx security headers, rate limiting, secrets management, HTTPS",
+    "skills": ["security-owasp", "python-patterns-best-practices"]
+  },
+  {
+    "name": "ReviewerAgent",
+    "zone_of_responsibility": "Code review, SOLID/DRY проверки, безопасность, производительность, совместимость с OpenWebUI",
+    "skills": ["python-patterns-best-practices", "backend-architecture-patterns"]
+  },
+  {
+    "name": "TesterAgent",
+    "zone_of_responsibility": "Unit/integration/e2e тесты для companion сервисов, pytest, coverage > 80%, smoke tests для OpenWebUI интеграции",
+    "skills": ["python-patterns-best-practices", "fastapi-backend-development"]
+  },
+  {
+    "name": "DocsAgent",
+    "zone_of_responsibility": "OpenAPI docs, README, ADR, inline docstrings, инструкция по развёртыванию, описание всех env vars",
+    "skills": ["context7-documentation-lookup", "skill-development"]
+  },
+  {
+    "name": "SkillCreatorAgent",
+    "zone_of_responsibility": "Создание и обновление скиллов для субагентов, онбординг новых агентов",
+    "skills": ["skill-development", "agent-development"]
+  }
+]

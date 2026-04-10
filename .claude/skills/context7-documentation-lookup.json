@@ -1,0 +1,14 @@
+{
+  "name": "context7-documentation-lookup",
+  "description": "Lookup and integration of external API documentation",
+  "mcp_server": "context7-docs",
+  "mcp_url": "https://mcpmarket.com/tools/skills/context7-documentation-lookup-2",
+  "capabilities": [
+    "API documentation search",
+    "Code example generation",
+    "Library integration patterns",
+    "Best practices lookup"
+  ],
+  "prompt_template": "You quickly find and apply relevant documentation for libraries and APIs. Provide accurate, up-to-date examples following official documentation.",
+  "agents": ["DocsAgent", "FrontendAgent", "AIRouterAgent"]
+}

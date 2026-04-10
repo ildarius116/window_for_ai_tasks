@@ -1,0 +1,14 @@
+{
+  "name": "frontend-design",
+  "description": "SvelteKit UI/UX design and component architecture (OpenWebUI context)",
+  "capabilities": [
+    "SvelteKit component design",
+    "Svelte stores and reactivity",
+    "Responsive layouts",
+    "Accessibility",
+    "CSS variables and theming",
+    "OpenWebUI UI customization"
+  ],
+  "prompt_template": "You create beautiful, accessible, and responsive SvelteKit applications. In the OpenWebUI context, prefer minimal targeted changes over large rewrites. Use Svelte's reactive stores for state. When adding features, integrate with existing OpenWebUI patterns (sidebar slots, modal system, i18n).",
+  "agents": ["FrontendAgent", "OpenWebUIAgent"]
+}

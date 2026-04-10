@@ -1,0 +1,118 @@
+model_list:
+  # --- Anthropic (direct) ---
+  - model_name: mws/sonnet
+    litellm_params:
+      model: claude-sonnet-4-6
+      api_key: os.environ/ANTHROPIC_API_KEY
+      max_tokens: 8192
+  - model_name: mws/opus
+    litellm_params:
+      model: claude-opus-4-6
+      api_key: os.environ/ANTHROPIC_API_KEY
+      max_tokens: 8192
+
+  # --- OpenRouter (free models) ---
+  - model_name: mws/nemotron-nano
+    litellm_params:
+      model: openrouter/nvidia/nemotron-nano-9b-v2:free
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: mws/nemotron
+    litellm_params:
+      model: openrouter/nvidia/nemotron-3-super-120b-a12b:free
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: mws/qwen-coder
+    litellm_params:
+      model: openrouter/qwen/qwen3-coder:free
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: mws/qwen-or
+    litellm_params:
+      model: openrouter/qwen/qwen3-next-80b-a3b-instruct:free
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # --- OpenAI (direct) ---
+  - model_name: mws/gpt-4o
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/OPENAI_API_KEY
+      max_tokens: 16384
+  - model_name: mws/gpt-4o-mini
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+      max_tokens: 16384
+  - model_name: mws/o3-mini
+    litellm_params:
+      model: openai/o3-mini
+      api_key: os.environ/OPENAI_API_KEY
+
+  # --- Qwen (direct via DashScope) ---
+  - model_name: mws/qwen
+    litellm_params:
+      model: openai/qwen-plus
+      api_key: os.environ/QWEN_API_KEY
+      api_base: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+  - model_name: mws/qwen3.5
+    litellm_params:
+      model: openai/qwen3.5-plus
+      api_key: os.environ/QWEN_API_KEY
+      api_base: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+
+  # --- Smart Router (auto-selects Sonnet or Opus by complexity) ---
+  - model_name: mws/auto
+    litellm_params:
+      model: auto_router/complexity_router
+      complexity_router_config:
+        tiers:
+          SIMPLE: mws/sonnet
+          MEDIUM: mws/sonnet
+          COMPLEX: mws/opus
+          REASONING: mws/opus
+        token_thresholds:
+          simple: 100
+          complex: 500
+        code_keywords:
+          - function
+          - class
+          - def
+          - async
+          - database
+          - architecture
+          - refactor
+          - design pattern
+          - algorithm
+        reasoning_keywords:
+          - step by step
+          - think through
+          - analyze
+          - debug
+          - compare
+          - evaluate
+        default_model: mws/sonnet
+
+router_settings:
+  routing_strategy: simple-shuffle
+  num_retries: 2
+  timeout: 120
+  fallbacks:
+    - mws/opus: ["mws/sonnet", "mws/gpt-4o", "mws/nemotron"]
+    - mws/sonnet: ["mws/opus", "mws/gpt-4o", "mws/nemotron"]
+    - mws/gpt-4o: ["mws/sonnet", "mws/nemotron"]
+    - mws/gpt-4o-mini: ["mws/nemotron-nano"]
+    - mws/o3-mini: ["mws/gpt-4o", "mws/sonnet"]
+    - mws/auto: ["mws/gpt-4o-mini", "mws/nemotron"]
+
+litellm_settings:
+  drop_params: true
+  success_callback: ["langfuse"]
+  failure_callback: ["langfuse"]
+  cache: true
+  cache_params:
+    type: redis
+    host: redis
+    port: 6379
+  max_internal_user_budget: 10
+  internal_user_budget_duration: "1mo"
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/LITELLM_DATABASE_URL

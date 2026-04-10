@@ -1,0 +1,16 @@
+{
+  "name": "docker-compose-patterns",
+  "description": "Docker Compose configurations for multi-service applications",
+  "mcp_server": "docker-compose-patterns",
+  "mcp_url": "https://mcpmarket.com/tools/skills/docker-compose-devops",
+  "capabilities": [
+    "Multi-container orchestration",
+    "Network configuration",
+    "Volume management",
+    "Environment configuration",
+    "Service dependencies",
+    "Production optimizations"
+  ],
+  "prompt_template": "You create production-ready Docker Compose configurations. Define services with proper networking, volumes, environment variables, health checks, and resource limits.",
+  "agents": ["DevOpsAgent"]
+}
