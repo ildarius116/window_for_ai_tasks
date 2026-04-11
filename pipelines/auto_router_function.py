@@ -279,7 +279,7 @@ class Pipe:
             vision_model = (
                 "mws/cotype-pro-vl"
                 if detected.lang == "ru"
-                else "mws/qwen2.5-vl-72b"
+                else "mws/qwen3-vl"
             )
             plan.append(
                 SubTask(
@@ -881,6 +881,13 @@ class Pipe:
     # Multimodal subagents
     # ------------------------------------------------------------------
 
+    _VISION_BLIND_RE = re.compile(
+        r"(?i)(i\s+(don't|do not|cannot|can't)\s+see\s+(an?\s+)?image|"
+        r"no\s+image\s+(was\s+)?(provided|attached|shared)|"
+        r"не\s+вижу\s+(изображени|картинк)|"
+        r"изображение\s+не\s+(предоставлено|прикреплено))"
+    )
+
     async def _sa_vision(self, task: SubTask) -> CompactResult:
         content: list[dict] = [
             {"type": "text", "text": task.input_text or "Опиши изображение."}
@@ -897,15 +904,38 @@ class Pipe:
             return CompactResult(
                 kind="vision", error="no image attachment available"
             )
-        resp = await self._call_litellm(
-            model=task.model or "mws/cotype-pro-vl",
-            messages=[{"role": "user", "content": content}],
-            temperature=0.3,
-            max_tokens=task.max_output_tokens or 500,
+
+        primary = task.model or "mws/cotype-pro-vl"
+        # cotype-pro-vl is proven working in smoke tests; use it as fallback
+        # whenever the primary silently drops the image.
+        fallback = (
+            "mws/cotype-pro-vl" if primary != "mws/cotype-pro-vl" else "mws/qwen3-vl"
         )
-        text = (
-            resp.get("choices", [{}])[0].get("message", {}).get("content") or ""
-        ).strip()
+
+        async def _call(model: str) -> str:
+            resp = await self._call_litellm(
+                model=model,
+                messages=[{"role": "user", "content": content}],
+                temperature=0.3,
+                max_tokens=task.max_output_tokens or 500,
+            )
+            return (
+                resp.get("choices", [{}])[0].get("message", {}).get("content") or ""
+            ).strip()
+
+        text = await _call(primary)
+        if not text or self._VISION_BLIND_RE.search(text):
+            try:
+                retry_text = await _call(fallback)
+                if retry_text and not self._VISION_BLIND_RE.search(retry_text):
+                    return CompactResult(
+                        kind="vision",
+                        summary=self._truncate_tokens(retry_text, 500),
+                        metadata={"primary": primary, "used": fallback},
+                    )
+            except Exception:
+                pass
+
         return CompactResult(kind="vision", summary=self._truncate_tokens(text, 500))
 
     async def _sa_stt(self, task: SubTask) -> CompactResult:

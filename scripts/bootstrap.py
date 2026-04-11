@@ -198,6 +198,15 @@ def main() -> int:
             fn_desc="Injects and extracts long-term user memories",
             fn_type="filter",
         )
+        seed_function(
+            cur,
+            user_id,
+            PIPELINES_DIR / "image_gen_function.py",
+            fn_id="mws_image_gen",
+            fn_name="MWS Image Generation",
+            fn_desc="Exposes mws/qwen-image* as virtual chat models (routes to /v1/images/generations).",
+            fn_type="pipe",
+        )
 
     log("✅ done")
     return 0
