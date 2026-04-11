@@ -74,6 +74,10 @@ services:
     environment:
       OPENAI_API_BASE_URLS: http://litellm:4000/v1
       OPENAI_API_KEYS: ${LITELLM_MASTER_KEY}
+      # Exposed so Pipe/Filter functions (e.g. auto_router_function.py) can read
+      # the master key via os.getenv("LITELLM_MASTER_KEY") — without this,
+      # Pipe calls back to LiteLLM return 401 Unauthorized.
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
       WEBUI_SECRET_KEY: ${OPENWEBUI_SECRET_KEY}
       WEBUI_NAME: "MWS GPT"
       DATABASE_URL: postgresql://${POSTGRES_USER:-mws}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-openwebui}
@@ -89,6 +93,9 @@ services:
       CHUNK_SIZE: "1500"
       CHUNK_OVERLAP: "100"
       RAG_TOP_K: "5"
+      ENABLE_RAG_WEB_SEARCH: "true"
+      RAG_WEB_SEARCH_ENGINE: "duckduckgo"
+      RAG_WEB_SEARCH_RESULT_COUNT: "3"
       AUDIO_STT_ENGINE: "openai"
       AUDIO_STT_OPENAI_API_BASE_URL: "http://litellm:4000/v1"
       AUDIO_STT_OPENAI_API_KEY: ${LITELLM_MASTER_KEY}
@@ -241,6 +248,35 @@ services:
       - /tmp
       - /var/cache/nginx
       - /var/run
+    networks:
+      - mws-network
+
+  bootstrap:
+    # One-shot init container. Waits for the first OpenWebUI user to sign up
+    # (= admin by default flow) and then UPSERTs Pipe/Filter functions into
+    # the openwebui DB so "MWS GPT Auto 🎯" and "MWS Memory" are registered
+    # automatically. Idempotent — safe to re-run on every `docker compose up`.
+    image: python:3.11-slim
+    container_name: mws-bootstrap
+    depends_on:
+      postgres:
+        condition: service_healthy
+      openwebui:
+        condition: service_started
+    environment:
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER:-mws}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: openwebui
+      PIPELINES_DIR: /pipelines
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_NO_CACHE_DIR: "1"
+    volumes:
+      - ./pipelines:/pipelines:ro
+      - ./scripts/bootstrap.py:/bootstrap.py:ro
+    command: >
+      sh -c "pip install --quiet psycopg2-binary==2.9.9 && python -u /bootstrap.py"
+    restart: on-failure
     networks:
       - mws-network
 

@@ -181,11 +181,58 @@ Backups older than 7 days are automatically cleaned up.
 | `pipelines/memory_function.py` | OpenWebUI filter for memory injection |
 | `pipelines/memory_tool.py` | Chat tool for viewing/managing memories |
 | `pipelines/usage_stats_tool.py` | Chat tool for usage statistics |
+| `pipelines/auto_router_function.py` | **MWS GPT Auto 🎯** — auto-router Pipe function (phase 9) |
+| `PLAN_chat_agents.md` | Master design doc for the auto-router |
+| `model_capabilities.md` | Curated model-to-task map used by the router |
 | `nginx/nginx.conf` | Reverse proxy with security config |
 | `monitoring/` | Prometheus config and Grafana dashboards |
 | `scripts/` | Database init, backup, restore, secrets check |
 | `.env.example` | Template for environment variables |
 | `CLAUDE.md` | AI agent instructions |
+
+## How to use MWS GPT Auto 🎯
+
+`MWS GPT Auto 🎯` is a virtual model in the OpenWebUI dropdown that auto-selects the right MWS model for every request.
+
+### Zero-config startup
+
+```bash
+cp .env.example .env          # fill MWS_GPT_API_KEY and secrets
+docker compose up -d          # OR: make up
+# → open http://localhost:3000 → sign up (first account becomes admin)
+```
+
+That's it. The stack runs an init sidecar (`bootstrap` service) that waits for the first signup and then seeds both `auto_router_function.py` and `memory_function.py` directly into OpenWebUI's database with `is_active=true` and `is_global=true`. After signup, reload the page once and `MWS GPT Auto 🎯` appears at the top of the model dropdown; the MWS Memory filter is already attached to every chat.
+
+No manual function upload, no API token, no additional commands.
+
+If you later edit a function source file and want to re-deploy it without restarting the stack, run `make deploy-functions` (requires `OWUI_ADMIN_TOKEN` for the HTTP API path).
+
+### What it does automatically
+
+| You send… | It dispatches to… |
+|---|---|
+| Plain text ("Расскажи про X") | `sa_ru_chat` (`mws/t-pro`) or `sa_general` (`mws/gpt-alpha`) |
+| Code question ("write fibonacci in rust") | `sa_code` (`mws/qwen3-coder`) |
+| Math/logic puzzle | `sa_reasoner` (`mws/deepseek-r1-32b`) |
+| Attached image | `sa_vision` (`mws/cotype-pro-vl` / `mws/qwen2.5-vl-72b`) |
+| Attached audio (`.mp3`, `.wav`) | `sa_stt` (`mws/whisper-turbo`) → re-planned by transcript |
+| Attached PDF/DOCX | `sa_doc_qa` (`mws/glm-4.6`, via built-in RAG) |
+| "Нарисуй …" / "generate image …" | `sa_image_gen` (`mws/qwen-image`) |
+| "Найди в интернете …" | `sa_web_search` (DuckDuckGo + `mws/kimi-k2`) |
+| A message with `https://…` | `sa_web_fetch` (`mws/llama-3.1-8b`) |
+
+Every response begins with a collapsible **🎯 Routing decision** block showing the detected language, chosen subagents and models. Each subagent runs in parallel, returns a compact summary (≤500 tokens), and the final `mws/t-pro`/`mws/gpt-alpha` aggregator streams the answer in markdown — without ever seeing the sub-responses' raw chain-of-thought.
+
+### Manual model override
+
+The dropdown also lists every raw `mws/*` alias from LiteLLM (26 models). Pick one manually — e.g. `mws/deepseek-r1-32b` — and the auto-router is **completely bypassed**: the request goes straight to LiteLLM. Use this when you want deterministic model selection or fine control.
+
+### Features covered (10 mandatory + 2 stubs)
+
+Text chat, voice chat (STT), image generation, audio-file + ASR, image analysis (VLM), file Q&A, web search, URL parsing, long-term memory (via existing `memory_function.py`), auto-select, manual-select, markdown + code — all working out of the box. Deep Research and slide-deck generation are v1 stubs and return a "will be added in v2" notice while still being classifiable.
+
+See `PLAN_chat_agents.md` for the full design and `tasks_done/phase-9-done.md` for the verification report.
 
 ## License
 

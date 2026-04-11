@@ -1,4 +1,4 @@
-.PHONY: up down ps logs build gen-secrets setup prod backup restore
+.PHONY: up down ps logs build gen-secrets setup prod backup restore deploy-functions
 
 up:
 	docker compose up -d
@@ -51,3 +51,12 @@ restore:
 		exit 1; \
 	fi
 	bash scripts/restore.sh $(DB) $(FILE)
+
+deploy-functions:
+	@if [ -z "$$OWUI_ADMIN_TOKEN" ]; then \
+		echo "❌ OWUI_ADMIN_TOKEN not set. Get it from OpenWebUI → Profile → API Keys, then: export OWUI_ADMIN_TOKEN=<token>"; \
+		exit 1; \
+	fi
+	@bash scripts/deploy_function.sh pipelines/auto_router_function.py
+	@bash scripts/deploy_function.sh pipelines/memory_function.py
+	@echo "✅ Functions deployed. Enable them in OpenWebUI → Admin → Functions."
