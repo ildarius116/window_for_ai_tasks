@@ -76,6 +76,11 @@ _WEB_SEARCH_RE = re.compile(
 )
 _DOC_EXT_RE = re.compile(r"\.(pdf|docx?|txt|md|rtf)$", re.IGNORECASE)
 _CYRILLIC_RE = re.compile(r"[а-яА-ЯёЁ]")
+_REASONER_RE = re.compile(
+    r"(?i)(\bдокажи\b|\bдоказать\b|\bдоказательство\b|\bтеорем\w*|\bлемма\w*|"
+    r"\bформально\b|\bprove\b|\bproof\b|\btheorem\b|\blemma\b|\bformally\b|"
+    r"[∀∃∈∉⊂⊆≡⇒⇔])"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +327,20 @@ class Pipe:
         if plan:
             return plan[: self.valves.max_subagents]
 
+        # Rule short-circuit: formal proofs / math reasoning → sa_reasoner.
+        # The LLM classifier tends to label "Докажи, что…" as generic chat,
+        # but we want deepseek-r1-32b to handle the CoT and strip it.
+        if _REASONER_RE.search(detected.last_user_text or ""):
+            plan.append(
+                SubTask(
+                    kind="reasoner",
+                    input_text=detected.last_user_text,
+                    model="mws/deepseek-r1-32b",
+                    metadata={"lang": detected.lang, "rule": "reasoner_regex"},
+                )
+            )
+            return plan[: self.valves.max_subagents]
+
         # Pure text — call LLM classifier
         kind, model = await self._llm_classify(detected)
         plan.append(
@@ -394,6 +413,14 @@ class Pipe:
             "presentation": "presentation",
         }
         kind = kind_map.get(intent, fallback_kind)
+        # Lang-aware override: gpt-oss-20b frequently returns intent="general"
+        # even for Russian text, which routes to sa_general / mws/gpt-alpha.
+        # For RU we prefer sa_ru_chat / mws/qwen3-235b so the Routing decision
+        # block matches the detected language.
+        if detected.lang == "ru" and kind == "general":
+            kind = "ru_chat"
+            if primary_model in ("mws/gpt-alpha", fallback_model):
+                primary_model = self.valves.default_ru_model
         return kind, primary_model
 
     # ------------------------------------------------------------------
