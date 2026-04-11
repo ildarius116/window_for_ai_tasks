@@ -14,6 +14,7 @@ import os
 import re
 import uuid
 from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Optional
 
 import httpx
@@ -81,6 +82,19 @@ _REASONER_RE = re.compile(
     r"\bформально\b|\bprove\b|\bproof\b|\btheorem\b|\blemma\b|\bformally\b|"
     r"[∀∃∈∉⊂⊆≡⇒⇔])"
 )
+_MEMORY_RECALL_RE = re.compile(
+    r"(?i)("
+    r"о ч[её]м (мы )?(говорили|был разговор|шла речь|шёл разговор|общались|беседовали)|"
+    r"что (мы )?обсуждали|когда мы говорили|"
+    r"что я тебе (рассказывал|говорил|писал)|"
+    r"помнишь,?\s+(как|что|о)|"
+    r"(вчера|позавчера|на прошлой неделе|в прошлом месяце|в прошлом году)\b|"
+    r"\d+\s+(час|день|дня|дней|недел[юяи]|месяц[ае]?в?|год[а]?|лет)\s+назад|"
+    r"what did we (discuss|talk about|say)|do you remember|"
+    r"last\s+(week|month|year)|a\s+(week|month|year)\s+ago|"
+    r"yesterday\b"
+    r")"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -140,12 +154,16 @@ class Pipe:
         messages = body.get("messages", []) or []
         files = body.get("files", []) or []
         trace_id = str(uuid.uuid4())
+        user_id = (__user__ or {}).get("id")
 
         detected = self._detect(messages, files)
         if self.valves.debug:
-            print(f"[mws-auto {trace_id[:8]}] detected={detected.to_dict()}")
+            print(
+                f"[mws-auto {trace_id[:8]}] detected={detected.to_dict()} "
+                f"user_id={user_id}"
+            )
 
-        plan = await self._classify_and_plan(detected, messages)
+        plan = await self._classify_and_plan(detected, messages, user_id=user_id)
         if self.valves.debug:
             print(
                 f"[mws-auto {trace_id[:8]}] plan={[(t.kind, t.model) for t in plan]}"
@@ -157,7 +175,7 @@ class Pipe:
 
         # Post-process: if stt happened and no chat-subagent yet, re-plan from transcript
         results = await self._maybe_reclassify_stt(
-            results, detected, messages, trace_id=trace_id
+            results, detected, messages, trace_id=trace_id, user_id=user_id
         )
 
         final_model = (
@@ -249,7 +267,10 @@ class Pipe:
     # ------------------------------------------------------------------
 
     async def _classify_and_plan(
-        self, detected: DetectedInput, messages: list
+        self,
+        detected: DetectedInput,
+        messages: list,
+        user_id: Optional[str] = None,
     ) -> list[SubTask]:
         plan: list[SubTask] = []
 
@@ -266,7 +287,7 @@ class Pipe:
                     input_text=detected.last_user_text or "Что на изображении?",
                     attachments=detected.image_attachments,
                     model=vision_model,
-                    metadata={"lang": detected.lang},
+                    metadata={"lang": detected.lang, "user_id": user_id},
                 )
             )
 
@@ -277,7 +298,7 @@ class Pipe:
                     input_text="",
                     attachments=detected.audio_attachments,
                     model="mws/whisper-turbo",
-                    metadata={"lang": detected.lang},
+                    metadata={"lang": detected.lang, "user_id": user_id},
                 )
             )
 
@@ -288,7 +309,7 @@ class Pipe:
                     input_text=detected.last_user_text or "Резюмируй документ.",
                     attachments=detected.document_attachments,
                     model="mws/glm-4.6",
-                    metadata={"lang": detected.lang},
+                    metadata={"lang": detected.lang, "user_id": user_id},
                 )
             )
 
@@ -298,7 +319,11 @@ class Pipe:
                     kind="web_fetch",
                     input_text=detected.last_user_text,
                     model="mws/llama-3.1-8b",
-                    metadata={"urls": detected.urls, "lang": detected.lang},
+                    metadata={
+                        "urls": detected.urls,
+                        "lang": detected.lang,
+                        "user_id": user_id,
+                    },
                 )
             )
 
@@ -308,7 +333,7 @@ class Pipe:
                     kind="image_gen",
                     input_text=detected.last_user_text,
                     model="mws/qwen-image",
-                    metadata={"lang": detected.lang},
+                    metadata={"lang": detected.lang, "user_id": user_id},
                 )
             )
 
@@ -318,13 +343,26 @@ class Pipe:
                     kind="web_search",
                     input_text=detected.last_user_text,
                     model="mws/kimi-k2",
-                    metadata={"lang": detected.lang},
+                    metadata={"lang": detected.lang, "user_id": user_id},
                 )
             )
 
         # Short-circuit path taken: if we have at least one signal, return plan as-is.
         # The aggregator itself will produce the final answer — no extra chat subagent.
         if plan:
+            return plan[: self.valves.max_subagents]
+
+        # Rule short-circuit: memory_recall. Must run BEFORE long_doc and
+        # reasoner so long questions about chat history don't bleed into
+        # sa_long_doc / sa_reasoner.
+        if _MEMORY_RECALL_RE.search(detected.last_user_text or ""):
+            plan.append(
+                SubTask(
+                    kind="memory_recall",
+                    input_text=detected.last_user_text,
+                    metadata={"user_id": user_id, "lang": detected.lang},
+                )
+            )
             return plan[: self.valves.max_subagents]
 
         # Rule short-circuit: long user input → sa_long_doc / mws/glm-4.6.
@@ -340,7 +378,11 @@ class Pipe:
                     kind="long_doc",
                     input_text=detected.last_user_text,
                     model="mws/glm-4.6",
-                    metadata={"lang": detected.lang, "rule": "long_text_regex"},
+                    metadata={
+                        "lang": detected.lang,
+                        "rule": "long_text_regex",
+                        "user_id": user_id,
+                    },
                 )
             )
             return plan[: self.valves.max_subagents]
@@ -354,25 +396,34 @@ class Pipe:
                     kind="reasoner",
                     input_text=detected.last_user_text,
                     model="mws/deepseek-r1-32b",
-                    metadata={"lang": detected.lang, "rule": "reasoner_regex"},
+                    metadata={
+                        "lang": detected.lang,
+                        "rule": "reasoner_regex",
+                        "user_id": user_id,
+                    },
                 )
             )
             return plan[: self.valves.max_subagents]
 
         # Pure text — call LLM classifier
-        kind, model = await self._llm_classify(detected)
+        kind, model, time_window = await self._llm_classify(detected)
+        meta: dict = {"lang": detected.lang, "user_id": user_id}
+        if time_window:
+            meta["time_window"] = time_window
         plan.append(
             SubTask(
                 kind=kind,
                 input_text=detected.last_user_text,
                 model=model,
-                metadata={"lang": detected.lang},
+                metadata=meta,
             )
         )
         return plan[: self.valves.max_subagents]
 
-    async def _llm_classify(self, detected: DetectedInput) -> tuple[str, str]:
-        """Return (kind, model) for pure-text requests. Falls back safely on error."""
+    async def _llm_classify(
+        self, detected: DetectedInput
+    ) -> tuple[str, str, Optional[dict]]:
+        """Return (kind, model, time_window) for pure-text requests. Falls back safely on error."""
         fallback_kind = "ru_chat" if detected.lang == "ru" else "general"
         fallback_model = (
             self.valves.default_ru_model
@@ -381,21 +432,44 @@ class Pipe:
         )
 
         if not detected.last_user_text.strip():
-            return fallback_kind, fallback_model
+            return fallback_kind, fallback_model, None
 
+        today = datetime.now(timezone.utc).date().isoformat()
         system = (
+            f"Current date: {today}\n"
             "You are a router. Classify the user request and return a JSON object "
             'with fields: {"intents": [...], "lang": "ru"|"en"|"other", '
             '"complexity": "trivial"|"normal"|"hard", "primary_model": "mws/...", '
-            '"reason": "<one sentence>"}. '
-            "Valid intents: code, math, ru_chat, general, long_doc, deep_research, presentation. "
+            '"reason": "<one sentence>", "time_window": {"from":"<ISO>","to":"<ISO>"}}. '
+            "Valid intents: code, math, ru_chat, general, long_doc, deep_research, "
+            "presentation, memory_recall. "
             "Valid primary_model: mws/gpt-alpha, mws/qwen3-235b, mws/qwen3-coder, "
             "mws/deepseek-r1-32b, mws/glm-4.6, mws/kimi-k2, mws/llama-3.1-8b. "
-            "Examples: "
+            "\n\nCRITICAL RULE — memory_recall:\n"
+            "If the user asks ANYTHING about past conversations, prior dialogs, "
+            "previously discussed topics, what they told you before, or what "
+            "happened in an earlier session — intent MUST be memory_recall. "
+            "This includes ALL semantic variations, not just specific keywords. "
+            "Examples of memory_recall (do NOT classify these as ru_chat/general): "
+            "'о чём мы говорили', 'о чём был разговор', 'какая была тема', "
+            "'что мы обсуждали', 'помнишь, что я рассказывал', 'вспомни наш диалог', "
+            "'про что шла речь', 'о чём я тебя спрашивал', 'какая была тема нашего "
+            "позавчерашнего разговора', 'что было вчера в чате', 'what did we discuss', "
+            "'do you remember our chat', 'what was our last topic'. "
+            "If the user also mentions a time marker (вчера, позавчера, 3 months ago, "
+            "last week, неделю назад, месяц назад), ALSO return "
+            'time_window: {"from":"<ISO-8601>","to":"<ISO-8601>"} relative to the '
+            "current date above (use a sensible window: for 'yesterday'/'вчера' — full "
+            "previous day; for 'last week' — previous 7 days; for 'N months ago' — "
+            "a ±15-day window around that date). Otherwise omit time_window.\n\n"
+            "Other intents examples: "
             '"write fibonacci in rust" -> {"intents":["code"],"primary_model":"mws/qwen3-coder",...}; '
             '"Провести глубокое исследование рынка EV" -> {"intents":["deep_research"],"primary_model":"mws/kimi-k2",...}; '
             '"Сделай презентацию про Python" -> {"intents":["presentation"],"primary_model":"mws/gpt-alpha",...}; '
-            '"Привет, как дела?" -> {"intents":["ru_chat"],"primary_model":"mws/qwen3-235b",...}.'
+            '"Привет, как дела?" -> {"intents":["ru_chat"],"primary_model":"mws/qwen3-235b",...}; '
+            '"о чём мы говорили неделю назад" -> {"intents":["memory_recall"],"lang":"ru","time_window":{"from":"2026-04-01T00:00:00Z","to":"2026-04-08T23:59:59Z"}}; '
+            '"какая была тема позавчерашнего разговора" -> {"intents":["memory_recall"],"lang":"ru","time_window":{"from":"2026-04-10T00:00:00Z","to":"2026-04-10T23:59:59Z"}}; '
+            '"о чём был разговор вчера" -> {"intents":["memory_recall"],"lang":"ru","time_window":{"from":"2026-04-11T00:00:00Z","to":"2026-04-11T23:59:59Z"}}.'
         )
         try:
             resp = await self._call_litellm(
@@ -405,7 +479,7 @@ class Pipe:
                     {"role": "user", "content": detected.last_user_text[:2000]},
                 ],
                 temperature=0,
-                max_tokens=200,
+                max_tokens=250,
                 response_format={"type": "json_object"},
             )
             content = (
@@ -415,7 +489,7 @@ class Pipe:
         except Exception as e:
             if self.valves.debug:
                 print(f"[mws-auto] classifier error: {e}")
-            return fallback_kind, fallback_model
+            return fallback_kind, fallback_model, None
 
         intents = data.get("intents") or []
         primary_model = data.get("primary_model") or fallback_model
@@ -429,6 +503,7 @@ class Pipe:
             "long_doc": "long_doc",
             "deep_research": "deep_research",
             "presentation": "presentation",
+            "memory_recall": "memory_recall",
         }
         kind = kind_map.get(intent, fallback_kind)
         # Lang-aware override: gpt-oss-20b frequently returns intent="general"
@@ -439,7 +514,15 @@ class Pipe:
             kind = "ru_chat"
             if primary_model in ("mws/gpt-alpha", fallback_model):
                 primary_model = self.valves.default_ru_model
-        return kind, primary_model
+        tw = data.get("time_window")
+        if isinstance(tw, dict) and (tw.get("from") or tw.get("to")):
+            time_window: Optional[dict] = {
+                "from": tw.get("from"),
+                "to": tw.get("to"),
+            }
+        else:
+            time_window = None
+        return kind, primary_model, time_window
 
     # ------------------------------------------------------------------
     # Routing-decision block
@@ -541,6 +624,7 @@ class Pipe:
             "doc_qa": self._sa_doc_qa,
             "deep_research": self._sa_deep_research,
             "presentation": self._sa_presentation,
+            "memory_recall": self._sa_memory_recall,
         }
         handler = dispatch.get(task.kind)
         if handler is None:
@@ -574,6 +658,7 @@ class Pipe:
         detected: DetectedInput,
         messages: list,
         trace_id: str,
+        user_id: Optional[str] = None,
     ) -> list[CompactResult]:
         """If sa_stt ran and there is no chat/text subagent yet, re-plan from transcript."""
         stt_result = next(
@@ -598,7 +683,9 @@ class Pipe:
         synth.urls = _URL_RE.findall(transcript)
         synth.wants_image_gen = bool(_IMAGE_GEN_RE.search(transcript))
         synth.wants_web_search = bool(_WEB_SEARCH_RE.search(transcript))
-        new_plan = await self._classify_and_plan(synth, messages)
+        new_plan = await self._classify_and_plan(
+            synth, messages, user_id=user_id
+        )
         # Skip duplicates already handled
         existing_kinds = {r.kind for r in results}
         new_plan = [t for t in new_plan if t.kind not in existing_kinds]
@@ -1092,6 +1179,58 @@ class Pipe:
             kind="doc_qa",
             summary=self._truncate_tokens(text, 500),
             citations=citations,
+        )
+
+    # ------------------------------------------------------------------
+    # Memory recall
+    # ------------------------------------------------------------------
+
+    async def _sa_memory_recall(self, task: SubTask) -> CompactResult:
+        user_id = task.metadata.get("user_id")
+        if not user_id:
+            return CompactResult(
+                kind="memory_recall",
+                summary="",
+                error="memory_recall: no user_id in metadata",
+            )
+        payload: dict = {
+            "user_id": user_id,
+            "query": task.input_text,
+            "limit": 5,
+        }
+        tw = task.metadata.get("time_window") or {}
+        if tw.get("from"):
+            payload["date_from"] = tw["from"]
+        if tw.get("to"):
+            payload["date_to"] = tw["to"]
+        try:
+            async with httpx.AsyncClient(timeout=15) as cli:
+                r = await cli.post(
+                    "http://memory-service:8000/episodes/recall",
+                    json=payload,
+                )
+                r.raise_for_status()
+                episodes = r.json()
+        except Exception as e:
+            return CompactResult(
+                kind="memory_recall",
+                summary="",
+                error=f"memory_recall request failed: {e}",
+            )
+        if not episodes:
+            return CompactResult(
+                kind="memory_recall",
+                summary="В истории диалогов ничего не найдено по этому запросу.",
+            )
+        lines: list[str] = []
+        for ep in episodes:
+            date = (ep.get("turn_end_at") or "")[:10]
+            lines.append(f"- [{date}] {(ep.get('summary') or '').strip()}")
+        body = "Найденные эпизоды из прошлых диалогов:\n" + "\n".join(lines)
+        return CompactResult(
+            kind="memory_recall",
+            summary=self._truncate_tokens(body, 500),
+            citations=[ep.get("chat_id") for ep in episodes if ep.get("chat_id")],
         )
 
     # ------------------------------------------------------------------

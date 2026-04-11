@@ -42,6 +42,9 @@ output/
 temp/
 tmp/
 
+# Persistent DB data (bind-mounted into postgres)
+data/
+
 # AI настройки
 .claude/settings.json
 */settings.json
