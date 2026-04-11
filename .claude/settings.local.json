@@ -44,7 +44,13 @@
       "Skill(update-config)",
       "Skill(statusline)",
       "Bash(bash ~/.claude/statusline-command.sh)",
-      "Bash(awk '{print $NF}')"
+      "Bash(awk '{print $NF}')",
+      "WebSearch",
+      "WebFetch(domain:docs.openwebui.com)",
+      "WebFetch(domain:zohaib.me)",
+      "WebFetch(domain:github.com)",
+      "Bash(mkdir -p \"C:/Users/Ildar.Sabirov/.claude/plans\")",
+      "Read(//c/Users/Ildar.Sabirov/.claude/plans/**)"
     ]
   }
 }
