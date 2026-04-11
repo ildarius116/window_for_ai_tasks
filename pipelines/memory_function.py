@@ -7,6 +7,7 @@ description: Injects relevant user memories into context and extracts new memori
 
 import json
 import urllib.request
+from datetime import datetime, timezone
 from typing import Optional
 
 from pydantic import BaseModel, Field
@@ -97,7 +98,12 @@ class Filter:
         body["messages"] = messages
         return body
 
-    def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
+    def outlet(
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        __metadata__: Optional[dict] = None,
+    ) -> dict:
         """Extract memories from the conversation after LLM response."""
         if not self.valves.enabled or not __user__:
             return body
@@ -115,12 +121,67 @@ class Filter:
 
         # Send last messages for extraction
         recent = messages[-8:] if len(messages) > 8 else messages
-        chat_id = body.get("chat_id", "unknown")
+        chat_id = (
+            body.get("chat_id")
+            or (__metadata__ or {}).get("chat_id")
+            or "unknown"
+        )
 
         self._request("POST", "/memories/extract", {
             "user_id": user_id,
             "chat_id": chat_id,
             "messages": recent,
         })
+
+        # Also write a conversation episode (summary + embedding). Errors
+        # here must NOT break the chat — swallow and log to debug only.
+        try:
+            window_size = len(recent)
+            total = len(messages)
+            clean_msgs = []
+            timestamps: list = []
+            for m in recent:
+                role = m.get("role") or ""
+                content = m.get("content")
+                if isinstance(content, list):
+                    # Strip attachments / non-text parts
+                    content = "\n".join(
+                        (p.get("text") or "")
+                        for p in content
+                        if isinstance(p, dict) and p.get("type") == "text"
+                    )
+                elif not isinstance(content, str):
+                    content = str(content or "")
+                clean_msgs.append({"role": role, "content": content})
+                ts = m.get("timestamp") or m.get("created_at")
+                if ts:
+                    timestamps.append(ts)
+
+            if timestamps:
+                turn_start_at = min(timestamps)
+                turn_end_at = max(timestamps)
+                if isinstance(turn_start_at, (int, float)):
+                    turn_start_at = datetime.fromtimestamp(
+                        turn_start_at, tz=timezone.utc
+                    ).isoformat()
+                if isinstance(turn_end_at, (int, float)):
+                    turn_end_at = datetime.fromtimestamp(
+                        turn_end_at, tz=timezone.utc
+                    ).isoformat()
+            else:
+                now_iso = datetime.now(timezone.utc).isoformat()
+                turn_start_at = now_iso
+                turn_end_at = now_iso
+
+            self._request("POST", "/episodes", {
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "messages": clean_msgs,
+                "message_indices": [total - window_size, total],
+                "turn_start_at": turn_start_at,
+                "turn_end_at": turn_end_at,
+            })
+        except Exception as e:
+            print(f"[MWS Memory] episodes write skipped: {e}")
 
         return body

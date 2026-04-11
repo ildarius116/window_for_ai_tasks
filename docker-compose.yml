@@ -136,6 +136,7 @@ services:
       EMBEDDING_MODEL: mws/bge-m3
       EMBEDDING_DIMENSIONS: "1024"
       EXTRACTION_MODEL: mws/gpt-alpha
+      SUMMARY_MODEL: mws/gpt-alpha
     depends_on:
       postgres:
         condition: service_healthy

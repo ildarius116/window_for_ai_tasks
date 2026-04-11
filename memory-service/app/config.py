@@ -14,3 +14,6 @@ EMBEDDING_DIMENSIONS = int(os.getenv("EMBEDDING_DIMENSIONS", "1024"))  # bge-m3 
 
 # Extraction model — used by LLM-based fact extraction from conversations
 EXTRACTION_MODEL = os.getenv("EXTRACTION_MODEL", "mws/gpt-alpha")
+
+# Summary model — used for one-shot conversation episode summaries
+SUMMARY_MODEL = os.getenv("SUMMARY_MODEL", "mws/gpt-alpha")
