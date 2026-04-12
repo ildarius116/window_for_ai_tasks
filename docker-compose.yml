@@ -1,7 +1,8 @@
 services:
   postgres:
     image: pgvector/pgvector:pg16
-    # Port not exposed to host — accessible only via mws-network
+    ports:
+      - "127.0.0.1:5432:5432"  # localhost only — accessible via SSH tunnel
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-mws}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
