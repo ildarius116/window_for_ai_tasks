@@ -243,6 +243,37 @@ class Pipe:
                         det.image_attachments.append({"url": url, "type": "image/*"})
                 last_user_text = "\n".join(p for p in parts if p)
             break
+        # Parse <mws_audio_files> tag injected by inlet filter
+        _audio_tag_re = re.compile(
+            r"<mws_audio_files>(.*?)</mws_audio_files>", re.DOTALL
+        )
+        _audio_match = _audio_tag_re.search(last_user_text)
+        if _audio_match:
+            try:
+                _audio_list = json.loads(_audio_match.group(1))
+                for af in _audio_list:
+                    det.has_audio = True
+                    det.audio_attachments.append(af)
+            except Exception:
+                pass
+            # Strip the tag from user text so it doesn't confuse the LLM
+            last_user_text = _audio_tag_re.sub("", last_user_text).strip()
+
+        # Parse <mws_doc_files> tag injected by inlet filter
+        _doc_tag_re = re.compile(
+            r"<mws_doc_files>(.*?)</mws_doc_files>", re.DOTALL
+        )
+        _doc_match = _doc_tag_re.search(last_user_text)
+        if _doc_match:
+            try:
+                _doc_list = json.loads(_doc_match.group(1))
+                for df in _doc_list:
+                    det.has_document = True
+                    det.document_attachments.append(df)
+            except Exception:
+                pass
+            last_user_text = _doc_tag_re.sub("", last_user_text).strip()
+
         det.last_user_text = last_user_text or ""
 
         # URLs
@@ -303,17 +334,30 @@ class Pipe:
             )
 
         if detected.has_document:
+            # Include current document filename so doc_qa can focus on it
+            doc_names = [
+                a.get("filename") or a.get("name") or "document"
+                for a in detected.document_attachments
+            ]
             plan.append(
                 SubTask(
                     kind="doc_qa",
                     input_text=detected.last_user_text or "Резюмируй документ.",
                     attachments=detected.document_attachments,
                     model="mws/glm-4.6",
-                    metadata={"lang": detected.lang, "user_id": user_id},
+                    metadata={
+                        "lang": detected.lang,
+                        "user_id": user_id,
+                        "doc_names": doc_names,
+                    },
                 )
             )
 
-        if detected.urls:
+        # Skip web_fetch when document or image is attached — URLs in the
+        # message are from RAG-injected citations (GitHub links inside PDF,
+        # accumulated sources from prior turns etc.), not user intent.
+        _has_attachment = detected.has_document or detected.has_image or detected.has_audio
+        if detected.urls and not _has_attachment:
             plan.append(
                 SubTask(
                     kind="web_fetch",
@@ -674,12 +718,17 @@ class Pipe:
         if has_chat:
             return results
         transcript = stt_result.summary
-        # Build synthetic DetectedInput from transcript
+        # Build synthetic DetectedInput from transcript.
+        # Preserve the ORIGINAL request language (detected.lang) when the user
+        # wrote an explicit prompt like "Summarize this audio".  Only override
+        # to transcript language when the user sent no text (audio-only).
         synth = DetectedInput(last_user_text=transcript, lang=detected.lang)
-        letters = [c for c in transcript if c.isalpha()]
-        if letters:
-            cyr = sum(1 for c in letters if _CYRILLIC_RE.match(c))
-            synth.lang = "ru" if (cyr / len(letters)) > 0.3 else "en"
+        if not detected.last_user_text.strip():
+            # Audio-only (no user text) — infer lang from transcript
+            letters = [c for c in transcript if c.isalpha()]
+            if letters:
+                cyr = sum(1 for c in letters if _CYRILLIC_RE.match(c))
+                synth.lang = "ru" if (cyr / len(letters)) > 0.3 else "en"
         synth.urls = _URL_RE.findall(transcript)
         synth.wants_image_gen = bool(_IMAGE_GEN_RE.search(transcript))
         synth.wants_web_search = bool(_WEB_SEARCH_RE.search(transcript))
@@ -946,12 +995,25 @@ class Pipe:
 
         audio_bytes: Optional[bytes] = None
         filename = att.get("name") or att.get("filename") or "audio.mp3"
-        if att.get("data"):
+
+        # 1. Local file path (injected by inlet filter from OpenWebUI uploads)
+        local_path = att.get("path", "")
+        if local_path:
+            import os
+            if os.path.isfile(local_path):
+                try:
+                    with open(local_path, "rb") as fp:
+                        audio_bytes = fp.read()
+                except Exception as e:
+                    return CompactResult(kind="stt", error=f"read local file: {e}")
+        # 2. Base64-encoded data
+        if not audio_bytes and att.get("data"):
             try:
                 audio_bytes = base64.b64decode(att["data"])
             except Exception as e:
                 return CompactResult(kind="stt", error=f"bad base64: {e}")
-        elif att.get("url"):
+        # 3. URL download
+        if not audio_bytes and att.get("url"):
             url = att["url"]
             async with httpx.AsyncClient(timeout=self.valves.request_timeout) as cli:
                 r = await cli.get(url)
@@ -1182,6 +1244,16 @@ class Pipe:
         if context:
             user_msg = f"{user_msg}\n\n--- DOCUMENT ---\n{context}"
 
+        # Focus the LLM on the specific document(s) from this message
+        doc_names = task.metadata.get("doc_names") or []
+        focus_hint = ""
+        if doc_names:
+            names_str = ", ".join(f'"{n}"' for n in doc_names)
+            focus_hint = (
+                f" Документ(ы) из текущего сообщения: {names_str}. "
+                "Отвечай ТОЛЬКО по этому документу, игнорируй контекст "
+                "из других документов/источников."
+            )
         resp = await self._call_litellm(
             model=task.model or "mws/glm-4.6",
             messages=[
@@ -1191,6 +1263,7 @@ class Pipe:
                         "Отвечай на вопрос по предоставленному документу. "
                         "Цитируй разделы/страницы, если указаны. "
                         "Если ответа в документе нет — скажи прямо."
+                        + focus_hint
                     ),
                 },
                 {"role": "user", "content": user_msg[:150_000]},

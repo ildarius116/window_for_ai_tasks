@@ -52,7 +52,10 @@
       "Bash(mkdir -p \"C:/Users/Ildar.Sabirov/.claude/plans\")",
       "Read(//c/Users/Ildar.Sabirov/.claude/plans/**)",
       "Bash(bash -n scripts/deploy_function.sh)",
-      "Bash(rerun:*)"
+      "Bash(rerun:*)",
+      "Bash(findstr \"mws-auto\")",
+      "Bash(tee tmp_logs.txt)",
+      "Bash(tee tmp_logs3.txt)"
     ]
   }
 }

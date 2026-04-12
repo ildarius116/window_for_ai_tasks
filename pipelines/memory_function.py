@@ -47,8 +47,77 @@ class Filter:
             print(f"[MWS Memory] Error: {e}")
             return {}
 
+    _AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".webm"}
+    _DOC_EXTS = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+                 ".txt", ".csv", ".md", ".rtf", ".odt"}
+
+    @classmethod
+    def _inject_file_tags(cls, body: dict) -> None:
+        """Inject <mws_audio_files> / <mws_doc_files> tags into the last user message.
+
+        OpenWebUI provides body["files"] to inlet filters but strips them
+        before calling pipe functions.  By embedding file metadata directly
+        into the message text, the auto-router pipe can detect uploads
+        and route to the correct subagent (STT for audio, doc_qa for docs).
+        """
+        # Use files from the CURRENT message (parent_message.files), not
+        # body["files"] which accumulates all files across the entire chat.
+        metadata = body.get("metadata") or {}
+        parent_msg = metadata.get("parent_message") or {}
+        files = parent_msg.get("files") or []
+        if not files:
+            files = body.get("files") or []
+
+        audio_files = []
+        doc_files = []
+        for f in files:
+            inner = f.get("file", {}) if isinstance(f, dict) else {}
+            meta = inner.get("meta", {})
+            ct = meta.get("content_type", "") or f.get("content_type", "")
+            fname = meta.get("name", "") or f.get("name", "")
+            fid = inner.get("id", "") or f.get("id", "")
+            path = inner.get("path", "")
+            fname_lower = fname.lower() if fname else ""
+
+            is_audio = ct.startswith("audio/") or any(
+                fname_lower.endswith(ext) for ext in cls._AUDIO_EXTS
+            )
+            is_doc = ct.startswith("application/pdf") or ct.startswith("text/") or any(
+                fname_lower.endswith(ext) for ext in cls._DOC_EXTS
+            )
+
+            entry = {"id": fid, "filename": fname, "path": path, "content_type": ct}
+            if is_audio:
+                audio_files.append(entry)
+            elif is_doc:
+                doc_files.append(entry)
+
+        tags = ""
+        if audio_files:
+            tags += "<mws_audio_files>" + json.dumps(audio_files) + "</mws_audio_files>"
+        if doc_files:
+            tags += "<mws_doc_files>" + json.dumps(doc_files) + "</mws_doc_files>"
+        if not tags:
+            return
+
+        messages = body.get("messages", [])
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    msg["content"] = (content + "\n" + tags) if content else tags
+                elif isinstance(content, list):
+                    content.append({"type": "text", "text": tags})
+                break
+
     def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
-        """Inject relevant memories into the system prompt before sending to LLM."""
+        """Inject relevant memories and audio file metadata before sending to LLM."""
+        # --- Pass audio/document file metadata through to pipe via message tag ---
+        # OpenWebUI strips body["files"] before calling pipe functions, but the
+        # auto-router needs to know about uploaded audio.  Inject a hidden tag
+        # into the last user message so _detect() can pick it up.
+        self._inject_file_tags(body)
+
         if not self.valves.enabled or not __user__:
             return body
 
