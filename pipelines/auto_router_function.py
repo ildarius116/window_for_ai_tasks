@@ -353,10 +353,11 @@ class Pipe:
                 )
             )
 
-        # Skip web_fetch when document is attached — URLs in the message are
-        # from RAG-injected citations (GitHub links inside PDF etc.), not from
-        # user intent to browse the web.
-        if detected.urls and not detected.has_document:
+        # Skip web_fetch when document or image is attached — URLs in the
+        # message are from RAG-injected citations (GitHub links inside PDF,
+        # accumulated sources from prior turns etc.), not user intent.
+        _has_attachment = detected.has_document or detected.has_image or detected.has_audio
+        if detected.urls and not _has_attachment:
             plan.append(
                 SubTask(
                     kind="web_fetch",
