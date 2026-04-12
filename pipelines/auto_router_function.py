@@ -441,6 +441,17 @@ class Pipe:
 
         # Pure text — call LLM classifier
         kind, model, time_window = await self._llm_classify(detected)
+
+        # Post-classifier safety net: if the classifier missed memory_recall
+        # (due to error, timeout, or weak model), but the text semantically
+        # refers to past conversations — override.  This check lives HERE
+        # (not inside _llm_classify) so it runs even when the classifier
+        # throws an exception and returns fallback.
+        if kind != "memory_recall" and self._looks_like_memory_recall(
+            detected.last_user_text
+        ):
+            kind = "memory_recall"
+
         meta: dict = {"lang": detected.lang, "user_id": user_id}
         if time_window:
             meta["time_window"] = time_window
@@ -453,6 +464,43 @@ class Pipe:
             )
         )
         return plan[: self.valves.max_subagents]
+
+    @staticmethod
+    def _looks_like_memory_recall(text: str) -> bool:
+        """Semantic check: does the text refer to past conversations?
+
+        Uses word-group intersection, NOT a single regex pattern.
+        The idea: if the text contains BOTH a "conversation" word AND a
+        "past reference" word, it's almost certainly memory_recall.
+        This catches hundreds of natural phrasings without enumerating each.
+        """
+        t = (text or "").lower()
+        # Group A: words indicating a conversation/dialog
+        conv_markers = (
+            "говорили", "разговаривали", "обсуждали", "общались",
+            "беседовали", "разговор", "диалог", "беседа", "беседу",
+            "обсуждение", "переписк", "чат", "чате",
+            "рассказывал", "писал", "спрашивал", "отвечал",
+            "discuss", "talk", "chat", "conversation", "said", "told",
+            "речь", "тем", "рассказал",
+        )
+        # Group B: words indicating past time or recall
+        time_markers = (
+            "вчера", "позавчера", "сегодня", "неделю", "месяц",
+            "раньше", "ранее", "прошл", "назад", "до этого",
+            "помнишь", "вспомни", "напомни", "забыл",
+            "yesterday", "today", "last week", "ago", "remember",
+            "earlier", "before", "previous", "prior",
+            "был ", "было ", "были ", "была ",
+        )
+        has_conv = any(m in t for m in conv_markers)
+        has_time = any(m in t for m in time_markers)
+        # Also catch "о чём мы..." / "о чём у нас..." pattern
+        has_about_us = ("о чем мы" in t or "о чём мы" in t
+                        or "о чем у нас" in t or "о чём у нас" in t
+                        or "что мы" in t or "what did we" in t
+                        or "do you remember" in t)
+        return (has_conv and has_time) or has_about_us
 
     async def _llm_classify(
         self, detected: DetectedInput
@@ -529,6 +577,7 @@ class Pipe:
         intents = data.get("intents") or []
         primary_model = data.get("primary_model") or fallback_model
         intent = intents[0] if intents else fallback_kind
+
         # Map intent → subagent kind
         kind_map = {
             "code": "code",

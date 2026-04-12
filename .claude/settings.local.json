@@ -65,7 +65,8 @@
       "Read(//c/Program Files/**)",
       "Read(//c/ProgramData/chocolatey/bin/**)",
       "Bash(powershell.exe -Command \"Get-Command sshpass -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source\")",
-      "Bash(choco list:*)"
+      "Bash(choco list:*)",
+      "Bash(cmd:*)"
     ]
   }
 }
