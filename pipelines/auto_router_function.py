@@ -224,7 +224,14 @@ class Pipe:
                 det.has_document = True
                 det.document_attachments.append(f)
 
-        # Last user message
+        # Last user message.
+        # NOTE: OpenWebUI can inject prior-turn citations/sources as extra text
+        # parts inside the current user message's `content` list. Joining all
+        # parts leaks old URLs and text into the current turn and skews routing
+        # (observed: follow-up "weather in Moscow" still carried a google.com
+        # URL from an earlier turn and got force-routed to web_fetch). Take
+        # only the LAST non-empty text part — conventionally the user's actual
+        # typed input — and ignore injected context parts.
         last_user_text = ""
         for msg in reversed(messages):
             if (msg or {}).get("role") != "user":
@@ -233,18 +240,20 @@ class Pipe:
             if isinstance(content, str):
                 last_user_text = content
             elif isinstance(content, list):
-                parts: list[str] = []
+                last_text_part = ""
                 for item in content:
                     if not isinstance(item, dict):
                         continue
                     itype = item.get("type")
                     if itype == "text":
-                        parts.append(item.get("text") or "")
+                        t = item.get("text") or ""
+                        if t.strip():
+                            last_text_part = t
                     elif itype == "image_url":
                         det.has_image = True
                         url = (item.get("image_url") or {}).get("url") or ""
                         det.image_attachments.append({"url": url, "type": "image/*"})
-                last_user_text = "\n".join(p for p in parts if p)
+                last_user_text = last_text_part
             break
         # Parse <mws_audio_files> tag injected by inlet filter
         _audio_tag_re = re.compile(
@@ -276,6 +285,29 @@ class Pipe:
             except Exception:
                 pass
             last_user_text = _doc_tag_re.sub("", last_user_text).strip()
+
+        # --- Strip OpenWebUI RAG template wrapper ---
+        # When OWUI has retrieval/web_search enabled and the chat has a
+        # knowledge source (e.g. a URL previously fetched by sa_web_fetch),
+        # it wraps every follow-up user turn in a template like:
+        #
+        #   ### Task: ...instructions...
+        #   <context>
+        #   <source id="1" name="https://..."> ...full page content... </source>
+        #   </context>
+        #
+        #   *   <user's actual query>
+        #
+        # This leaks the page URL and content into our router and forces
+        # web_fetch on every follow-up. Strip everything up to and
+        # including the closing </context> tag and keep only the real
+        # user query from the tail.
+        if "</context>" in last_user_text and "<context>" in last_user_text:
+            tail = last_user_text.split("</context>", 1)[1]
+            # Trim bullet / whitespace prefixes: "*   ", "- ", "• ", leading blanks
+            tail = re.sub(r"^[\s\*\-\u2022]+", "", tail).strip()
+            if tail:
+                last_user_text = tail
 
         det.last_user_text = last_user_text or ""
 
@@ -356,23 +388,31 @@ class Pipe:
                 )
             )
 
-        # Skip web_fetch when document or image is attached — URLs in the
-        # message are from RAG-injected citations (GitHub links inside PDF,
-        # accumulated sources from prior turns etc.), not user intent.
+        # URL short-circuit — guarded two ways:
+        # 1. Skip when a document/image/audio is attached: URLs in that case
+        #    come from RAG-injected citations (GitHub links inside a PDF,
+        #    accumulated sources from prior turns etc.), not user intent.
+        # 2. Skip when the URL is incidental inside longer conversational text
+        #    — only force web_fetch when the URL dominates the message (bare
+        #    link with brief framing like "что здесь?"). Otherwise every
+        #    follow-up question in a chat that once cited a URL gets
+        #    force-routed to web_fetch.
         _has_attachment = detected.has_document or detected.has_image or detected.has_audio
         if detected.urls and not _has_attachment:
-            plan.append(
-                SubTask(
-                    kind="web_fetch",
-                    input_text=detected.last_user_text,
-                    model="mws/llama-3.1-8b",
-                    metadata={
-                        "urls": detected.urls,
-                        "lang": detected.lang,
-                        "user_id": user_id,
-                    },
+            non_url_text = _URL_RE.sub("", detected.last_user_text).strip()
+            if len(non_url_text) <= 60:
+                plan.append(
+                    SubTask(
+                        kind="web_fetch",
+                        input_text=detected.last_user_text,
+                        model="mws/llama-3.1-8b",
+                        metadata={
+                            "urls": detected.urls,
+                            "lang": detected.lang,
+                            "user_id": user_id,
+                        },
+                    )
                 )
-            )
 
         if detected.wants_image_gen:
             plan.append(
