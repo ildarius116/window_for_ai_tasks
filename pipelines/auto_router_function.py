@@ -399,6 +399,14 @@ class Pipe:
         if plan:
             return plan[: self.valves.max_subagents]
 
+        # Detect follow-up / context-referencing questions that don't need a
+        # subagent — the aggregator can answer them directly from chat history.
+        # Examples: "на русском", "переведи", "о чём было первое сообщение",
+        # "расскажи подробнее", "предыдущий ответ".
+        if len(messages) > 2 and self._is_context_followup(detected.last_user_text):
+            # Return empty plan — aggregator will use conversation history
+            return []
+
         # Rule short-circuit: long user input → sa_long_doc / mws/glm-4.6.
         # Anything ≥1500 chars is almost certainly a document/transcript, not a
         # chat turn, and glm-4.6 handles long context better than qwen3-235b.
@@ -469,6 +477,44 @@ class Pipe:
             )
         )
         return plan[: self.valves.max_subagents]
+
+    @staticmethod
+    def _is_context_followup(text: str) -> bool:
+        """Detect if the user message is a follow-up that references conversation
+        context (previous answers, translation requests, clarifications).
+        These don't need a subagent — the aggregator handles them from history."""
+        t = (text or "").lower().strip()
+        if not t or len(t) > 300:
+            return False
+        _FOLLOWUP_PATTERNS = [
+            # Russian
+            r"предыдущ",        # предыдущий ответ
+            r"на русском",
+            r"на английском",
+            r"переведи",
+            r"перефразируй",
+            r"повтори",
+            r"подробнее",
+            r"первое сообщение",
+            r"первый вопрос",
+            r"о чём (мы|было|был[аи]?)",
+            r"что (мы|я) (спрашивал|говорил|обсуждал|писал)",
+            r"в этой сессии",
+            r"в этом (чате|диалоге|разговоре)",
+            r"ранее",
+            r"выше",
+            # English
+            r"previous (answer|response|message)",
+            r"in (russian|english)",
+            r"translate",
+            r"rephrase",
+            r"repeat",
+            r"more detail",
+            r"first message",
+            r"earlier in (this|our)",
+            r"what did (we|i|you) (talk|discuss|say|ask)",
+        ]
+        return any(re.search(p, t) for p in _FOLLOWUP_PATTERNS)
 
     @staticmethod
     def _extract_time_window(text: str) -> Optional[dict]:
@@ -918,15 +964,34 @@ class Pipe:
             "Если в результатах субагентов есть 'Citations:', обязательно вставь "
             "ссылки в текст как пронумерованные цитаты [1], [2], [3] и перечисли "
             "их в конце ответа в формате: [1] URL, [2] URL и т.д. "
+            "ВАЖНО: ты получаешь полную историю диалога. Если пользователь спрашивает "
+            "о предыдущих сообщениях, содержании беседы, или просит переформулировать/"
+            "перевести предыдущий ответ — используй историю диалога, а НЕ результаты "
+            "субагентов. Результаты субагентов полезны только для нового контента "
+            "(поиск, fetch, генерация). "
             f"{lang_instr}\n\n--- SUBAGENT RESULTS ---\n{scratchpad}"
         )
 
-        # Keep the user's most recent message as the final user turn
-        user_msg = self._last_user_message(messages)
-        final_messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_msg},
-        ]
+        # Pass conversation history so the aggregator understands context
+        # (e.g. "translate previous answer", "now in Russian", follow-ups)
+        final_messages = [{"role": "system", "content": system_prompt}]
+        # Include up to last 10 messages (user + assistant turns) for context
+        history = (messages or [])[-10:]
+        for msg in history:
+            role = (msg or {}).get("role", "")
+            if role not in ("user", "assistant"):
+                continue
+            content = msg.get("content")
+            if isinstance(content, list):
+                # Flatten multimodal content to text only
+                text_parts = [
+                    i.get("text", "")
+                    for i in content
+                    if isinstance(i, dict) and i.get("type") == "text"
+                ]
+                content = "\n".join(text_parts)
+            if isinstance(content, str) and content.strip():
+                final_messages.append({"role": role, "content": content})
 
         try:
             async for chunk in self._call_litellm_stream(
