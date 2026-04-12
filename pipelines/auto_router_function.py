@@ -439,8 +439,8 @@ class Pipe:
             )
             return plan[: self.valves.max_subagents]
 
-        # Pure text — call LLM classifier
-        kind, model, time_window = await self._llm_classify(detected)
+        # Pure text — call LLM classifier (pass recent messages for context)
+        kind, model, time_window = await self._llm_classify(detected, messages)
 
         # Post-classifier safety net: if the classifier missed memory_recall
         # (due to error, timeout, or weak model), but the text semantically
@@ -448,7 +448,7 @@ class Pipe:
         # (not inside _llm_classify) so it runs even when the classifier
         # throws an exception and returns fallback.
         if kind != "memory_recall" and self._looks_like_memory_recall(
-            detected.last_user_text
+            detected.last_user_text, messages
         ):
             kind = "memory_recall"
 
@@ -465,45 +465,73 @@ class Pipe:
         )
         return plan[: self.valves.max_subagents]
 
-    @staticmethod
-    def _looks_like_memory_recall(text: str) -> bool:
+    _CONV_MARKERS = (
+        "говорили", "разговаривали", "обсуждали", "общались",
+        "беседовали", "разговор", "диалог", "беседа", "беседу",
+        "обсуждение", "переписк", "чат", "чате",
+        "рассказывал", "писал", "спрашивал", "отвечал",
+        "discuss", "talk", "chat", "conversation", "said", "told",
+        "речь", "тем", "рассказал",
+    )
+    _TIME_MARKERS = (
+        "вчера", "позавчера", "сегодня", "неделю", "месяц",
+        "раньше", "ранее", "прошл", "назад", "до этого",
+        "помнишь", "вспомни", "напомни", "забыл",
+        "yesterday", "today", "last week", "ago", "remember",
+        "earlier", "before", "previous", "prior",
+        "был ", "было ", "были ", "была ",
+    )
+
+    @classmethod
+    def _looks_like_memory_recall(cls, text: str, messages: list | None = None) -> bool:
         """Semantic check: does the text refer to past conversations?
 
         Uses word-group intersection, NOT a single regex pattern.
         The idea: if the text contains BOTH a "conversation" word AND a
         "past reference" word, it's almost certainly memory_recall.
-        This catches hundreds of natural phrasings without enumerating each.
+
+        Also handles follow-ups: if a recent user message in the conversation
+        was about memory recall (had conv markers), and the current message
+        has a time marker (e.g. "а вчера?"), treat it as memory_recall.
         """
         t = (text or "").lower()
-        # Group A: words indicating a conversation/dialog
-        conv_markers = (
-            "говорили", "разговаривали", "обсуждали", "общались",
-            "беседовали", "разговор", "диалог", "беседа", "беседу",
-            "обсуждение", "переписк", "чат", "чате",
-            "рассказывал", "писал", "спрашивал", "отвечал",
-            "discuss", "talk", "chat", "conversation", "said", "told",
-            "речь", "тем", "рассказал",
-        )
-        # Group B: words indicating past time or recall
-        time_markers = (
-            "вчера", "позавчера", "сегодня", "неделю", "месяц",
-            "раньше", "ранее", "прошл", "назад", "до этого",
-            "помнишь", "вспомни", "напомни", "забыл",
-            "yesterday", "today", "last week", "ago", "remember",
-            "earlier", "before", "previous", "prior",
-            "был ", "было ", "были ", "была ",
-        )
-        has_conv = any(m in t for m in conv_markers)
-        has_time = any(m in t for m in time_markers)
-        # Also catch "о чём мы..." / "о чём у нас..." pattern
+        has_conv = any(m in t for m in cls._CONV_MARKERS)
+        has_time = any(m in t for m in cls._TIME_MARKERS)
+        # Direct "о чём мы..." / "о чём у нас..." pattern
         has_about_us = ("о чем мы" in t or "о чём мы" in t
                         or "о чем у нас" in t or "о чём у нас" in t
                         or "что мы" in t or "what did we" in t
                         or "do you remember" in t)
-        return (has_conv and has_time) or has_about_us
+
+        if (has_conv and has_time) or has_about_us:
+            return True
+
+        # Follow-up detection: current message is short and has a time marker
+        # (e.g. "а вчера?", "а на прошлой неделе?"), and a recent user message
+        # in the conversation was about memory recall.
+        if has_time and messages and len(t) < 50:
+            for m in reversed(messages[:-1]):  # skip current message
+                if m.get("role") != "user":
+                    continue
+                prev = m.get("content", "")
+                if isinstance(prev, list):
+                    prev = " ".join(
+                        p.get("text", "") for p in prev
+                        if isinstance(p, dict) and p.get("type") == "text"
+                    )
+                prev = (prev or "").lower()
+                prev_conv = any(mk in prev for mk in cls._CONV_MARKERS)
+                prev_about = ("о чем мы" in prev or "о чём мы" in prev
+                              or "о чем у нас" in prev or "о чём у нас" in prev
+                              or "что мы" in prev or "what did we" in prev)
+                if prev_conv or prev_about:
+                    return True
+                break  # only check the most recent user message
+
+        return False
 
     async def _llm_classify(
-        self, detected: DetectedInput
+        self, detected: DetectedInput, messages: list | None = None
     ) -> tuple[str, str, Optional[dict]]:
         """Return (kind, model, time_window) for pure-text requests. Falls back safely on error."""
         fallback_kind = "ru_chat" if detected.lang == "ru" else "general"
@@ -554,13 +582,34 @@ class Pipe:
             '"о чём был разговор вчера" -> {"intents":["memory_recall"],"lang":"ru","time_window":{"from":"2026-04-11T00:00:00Z","to":"2026-04-11T23:59:59Z"}}; '
             '"о чём мы сегодня разговаривали" -> {"intents":["memory_recall"],"lang":"ru","time_window":{"from":"2026-04-12T00:00:00Z","to":"2026-04-12T23:59:59Z"}}.'
         )
+        # Build classifier input: include recent conversation context so
+        # the classifier can understand follow-up messages like "а вчера?"
+        # after a memory_recall question.
+        classifier_msgs: list[dict] = [{"role": "system", "content": system}]
+        if messages and len(messages) > 1:
+            # Include last few turns (up to 6 messages) for context,
+            # but truncate each to keep token usage low.
+            recent = messages[-6:]
+            for m in recent[:-1]:  # all except last (added separately)
+                role = m.get("role", "user")
+                text = m.get("content", "")
+                if isinstance(text, list):
+                    text = " ".join(
+                        p.get("text", "") for p in text
+                        if isinstance(p, dict) and p.get("type") == "text"
+                    )
+                if role in ("user", "assistant") and text.strip():
+                    classifier_msgs.append(
+                        {"role": role, "content": text[:300]}
+                    )
+        classifier_msgs.append(
+            {"role": "user", "content": detected.last_user_text[:2000]}
+        )
+
         try:
             resp = await self._call_litellm(
                 model=self.valves.classifier_model,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": detected.last_user_text[:2000]},
-                ],
+                messages=classifier_msgs,
                 temperature=0,
                 max_tokens=250,
                 response_format={"type": "json_object"},
