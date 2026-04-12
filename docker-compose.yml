@@ -1,13 +1,14 @@
 services:
   postgres:
     image: pgvector/pgvector:pg16
-    # Port not exposed to host — accessible only via mws-network
+    ports:
+      - "127.0.0.1:5432:5432"  # localhost only — accessible via SSH tunnel
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-mws}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB:-openwebui}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - ./data/postgres:/var/lib/postgresql/data
       - ./scripts/init-databases.sql:/docker-entrypoint-initdb.d/init-databases.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mws} -d ${POSTGRES_DB:-openwebui}"]
@@ -136,6 +137,7 @@ services:
       EMBEDDING_MODEL: mws/bge-m3
       EMBEDDING_DIMENSIONS: "1024"
       EXTRACTION_MODEL: mws/gpt-alpha
+      SUMMARY_MODEL: mws/gpt-alpha
     depends_on:
       postgres:
         condition: service_healthy
@@ -285,7 +287,6 @@ networks:
     driver: bridge
 
 volumes:
-  postgres_data:
   redis_data:
   openwebui_data:
   prometheus_data:

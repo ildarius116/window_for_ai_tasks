@@ -14,6 +14,7 @@ import os
 import re
 import uuid
 from dataclasses import dataclass, field, asdict
+from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncGenerator, Optional
 
 import httpx
@@ -140,12 +141,16 @@ class Pipe:
         messages = body.get("messages", []) or []
         files = body.get("files", []) or []
         trace_id = str(uuid.uuid4())
+        user_id = (__user__ or {}).get("id")
 
         detected = self._detect(messages, files)
         if self.valves.debug:
-            print(f"[mws-auto {trace_id[:8]}] detected={detected.to_dict()}")
+            print(
+                f"[mws-auto {trace_id[:8]}] detected={detected.to_dict()} "
+                f"user_id={user_id}"
+            )
 
-        plan = await self._classify_and_plan(detected, messages)
+        plan = await self._classify_and_plan(detected, messages, user_id=user_id)
         if self.valves.debug:
             print(
                 f"[mws-auto {trace_id[:8]}] plan={[(t.kind, t.model) for t in plan]}"
@@ -157,7 +162,7 @@ class Pipe:
 
         # Post-process: if stt happened and no chat-subagent yet, re-plan from transcript
         results = await self._maybe_reclassify_stt(
-            results, detected, messages, trace_id=trace_id
+            results, detected, messages, trace_id=trace_id, user_id=user_id
         )
 
         final_model = (
@@ -166,10 +171,26 @@ class Pipe:
             else self.valves.default_en_model
         )
 
-        async for chunk in self._stream_aggregate(
-            final_model, messages, results, detected, trace_id=trace_id
-        ):
-            yield chunk
+        has_artifacts = any(
+            art.get("url") for r in results for art in (r.artifacts or [])
+        )
+        if has_artifacts:
+            # Buffer the full response so we can strip hallucinated image links
+            buf: list[str] = []
+            async for chunk in self._stream_aggregate(
+                final_model, messages, results, detected, trace_id=trace_id
+            ):
+                buf.append(chunk)
+            text = "".join(buf)
+            # Remove markdown image links — real images are appended via _render_artifacts
+            text = re.sub(r"!\[[^\]]*\]\([^\)]+\)", "", text)
+            text = re.sub(r"\n{3,}", "\n\n", text).strip()
+            yield text
+        else:
+            async for chunk in self._stream_aggregate(
+                final_model, messages, results, detected, trace_id=trace_id
+            ):
+                yield chunk
 
         # Append artifacts (generated images) as markdown after stream
         artifact_md = self._render_artifacts(results)
@@ -234,6 +255,37 @@ class Pipe:
                         det.image_attachments.append({"url": url, "type": "image/*"})
                 last_user_text = last_text_part
             break
+        # Parse <mws_audio_files> tag injected by inlet filter
+        _audio_tag_re = re.compile(
+            r"<mws_audio_files>(.*?)</mws_audio_files>", re.DOTALL
+        )
+        _audio_match = _audio_tag_re.search(last_user_text)
+        if _audio_match:
+            try:
+                _audio_list = json.loads(_audio_match.group(1))
+                for af in _audio_list:
+                    det.has_audio = True
+                    det.audio_attachments.append(af)
+            except Exception:
+                pass
+            # Strip the tag from user text so it doesn't confuse the LLM
+            last_user_text = _audio_tag_re.sub("", last_user_text).strip()
+
+        # Parse <mws_doc_files> tag injected by inlet filter
+        _doc_tag_re = re.compile(
+            r"<mws_doc_files>(.*?)</mws_doc_files>", re.DOTALL
+        )
+        _doc_match = _doc_tag_re.search(last_user_text)
+        if _doc_match:
+            try:
+                _doc_list = json.loads(_doc_match.group(1))
+                for df in _doc_list:
+                    det.has_document = True
+                    det.document_attachments.append(df)
+            except Exception:
+                pass
+            last_user_text = _doc_tag_re.sub("", last_user_text).strip()
+
         det.last_user_text = last_user_text or ""
 
         # URLs
@@ -258,7 +310,10 @@ class Pipe:
     # ------------------------------------------------------------------
 
     async def _classify_and_plan(
-        self, detected: DetectedInput, messages: list
+        self,
+        detected: DetectedInput,
+        messages: list,
+        user_id: Optional[str] = None,
     ) -> list[SubTask]:
         plan: list[SubTask] = []
 
@@ -267,7 +322,7 @@ class Pipe:
             vision_model = (
                 "mws/cotype-pro-vl"
                 if detected.lang == "ru"
-                else "mws/qwen2.5-vl-72b"
+                else "mws/qwen3-vl"
             )
             plan.append(
                 SubTask(
@@ -275,7 +330,7 @@ class Pipe:
                     input_text=detected.last_user_text or "Что на изображении?",
                     attachments=detected.image_attachments,
                     model=vision_model,
-                    metadata={"lang": detected.lang},
+                    metadata={"lang": detected.lang, "user_id": user_id},
                 )
             )
 
@@ -286,27 +341,41 @@ class Pipe:
                     input_text="",
                     attachments=detected.audio_attachments,
                     model="mws/whisper-turbo",
-                    metadata={"lang": detected.lang},
+                    metadata={"lang": detected.lang, "user_id": user_id},
                 )
             )
 
         if detected.has_document:
+            # Include current document filename so doc_qa can focus on it
+            doc_names = [
+                a.get("filename") or a.get("name") or "document"
+                for a in detected.document_attachments
+            ]
             plan.append(
                 SubTask(
                     kind="doc_qa",
                     input_text=detected.last_user_text or "Резюмируй документ.",
                     attachments=detected.document_attachments,
                     model="mws/glm-4.6",
-                    metadata={"lang": detected.lang},
+                    metadata={
+                        "lang": detected.lang,
+                        "user_id": user_id,
+                        "doc_names": doc_names,
+                    },
                 )
             )
 
-        # URL short-circuit: only force web_fetch when the URL dominates the
-        # user's message (a bare link with brief framing like "что здесь?").
-        # For longer conversational text containing a URL incidentally, fall
-        # through to the classifier — otherwise every follow-up question in a
-        # chat that once cited a URL gets force-routed to web_fetch.
-        if detected.urls:
+        # URL short-circuit — guarded two ways:
+        # 1. Skip when a document/image/audio is attached: URLs in that case
+        #    come from RAG-injected citations (GitHub links inside a PDF,
+        #    accumulated sources from prior turns etc.), not user intent.
+        # 2. Skip when the URL is incidental inside longer conversational text
+        #    — only force web_fetch when the URL dominates the message (bare
+        #    link with brief framing like "что здесь?"). Otherwise every
+        #    follow-up question in a chat that once cited a URL gets
+        #    force-routed to web_fetch.
+        _has_attachment = detected.has_document or detected.has_image or detected.has_audio
+        if detected.urls and not _has_attachment:
             non_url_text = _URL_RE.sub("", detected.last_user_text).strip()
             if len(non_url_text) <= 60:
                 plan.append(
@@ -314,7 +383,11 @@ class Pipe:
                         kind="web_fetch",
                         input_text=detected.last_user_text,
                         model="mws/llama-3.1-8b",
-                        metadata={"urls": detected.urls, "lang": detected.lang},
+                        metadata={
+                            "urls": detected.urls,
+                            "lang": detected.lang,
+                            "user_id": user_id,
+                        },
                     )
                 )
 
@@ -324,7 +397,7 @@ class Pipe:
                     kind="image_gen",
                     input_text=detected.last_user_text,
                     model="mws/qwen-image",
-                    metadata={"lang": detected.lang},
+                    metadata={"lang": detected.lang, "user_id": user_id},
                 )
             )
 
@@ -334,7 +407,7 @@ class Pipe:
                     kind="web_search",
                     input_text=detected.last_user_text,
                     model="mws/kimi-k2",
-                    metadata={"lang": detected.lang},
+                    metadata={"lang": detected.lang, "user_id": user_id},
                 )
             )
 
@@ -342,6 +415,14 @@ class Pipe:
         # The aggregator itself will produce the final answer — no extra chat subagent.
         if plan:
             return plan[: self.valves.max_subagents]
+
+        # Detect follow-up / context-referencing questions that don't need a
+        # subagent — the aggregator can answer them directly from chat history.
+        # Examples: "на русском", "переведи", "о чём было первое сообщение",
+        # "расскажи подробнее", "предыдущий ответ".
+        if len(messages) > 2 and self._is_context_followup(detected.last_user_text):
+            # Return empty plan — aggregator will use conversation history
+            return []
 
         # Rule short-circuit: long user input → sa_long_doc / mws/glm-4.6.
         # Anything ≥1500 chars is almost certainly a document/transcript, not a
@@ -356,7 +437,11 @@ class Pipe:
                     kind="long_doc",
                     input_text=detected.last_user_text,
                     model="mws/glm-4.6",
-                    metadata={"lang": detected.lang, "rule": "long_text_regex"},
+                    metadata={
+                        "lang": detected.lang,
+                        "rule": "long_text_regex",
+                        "user_id": user_id,
+                    },
                 )
             )
             return plan[: self.valves.max_subagents]
@@ -370,25 +455,192 @@ class Pipe:
                     kind="reasoner",
                     input_text=detected.last_user_text,
                     model="mws/deepseek-r1-32b",
-                    metadata={"lang": detected.lang, "rule": "reasoner_regex"},
+                    metadata={
+                        "lang": detected.lang,
+                        "rule": "reasoner_regex",
+                        "user_id": user_id,
+                    },
                 )
             )
             return plan[: self.valves.max_subagents]
 
-        # Pure text — call LLM classifier
-        kind, model = await self._llm_classify(detected)
+        # Pure text — call LLM classifier (pass recent messages for context)
+        kind, model, time_window = await self._llm_classify(detected, messages)
+
+        # Post-classifier safety net: if the classifier missed memory_recall
+        # (due to error, timeout, or weak model), but the text semantically
+        # refers to past conversations — override.  This check lives HERE
+        # (not inside _llm_classify) so it runs even when the classifier
+        # throws an exception and returns fallback.
+        if kind != "memory_recall" and self._looks_like_memory_recall(
+            detected.last_user_text, messages
+        ):
+            kind = "memory_recall"
+
+        # If routed to memory_recall but no time_window from classifier,
+        # try to extract one from the user text.
+        if kind == "memory_recall" and not time_window:
+            time_window = self._extract_time_window(detected.last_user_text)
+
+        meta: dict = {"lang": detected.lang, "user_id": user_id}
+        if time_window:
+            meta["time_window"] = time_window
         plan.append(
             SubTask(
                 kind=kind,
                 input_text=detected.last_user_text,
                 model=model,
-                metadata={"lang": detected.lang},
+                metadata=meta,
             )
         )
         return plan[: self.valves.max_subagents]
 
-    async def _llm_classify(self, detected: DetectedInput) -> tuple[str, str]:
-        """Return (kind, model) for pure-text requests. Falls back safely on error."""
+    @staticmethod
+    def _is_context_followup(text: str) -> bool:
+        """Detect if the user message is a follow-up that references conversation
+        context (previous answers, translation requests, clarifications).
+        These don't need a subagent — the aggregator handles them from history."""
+        t = (text or "").lower().strip()
+        if not t or len(t) > 300:
+            return False
+        _FOLLOWUP_PATTERNS = [
+            # Russian
+            r"предыдущ",        # предыдущий ответ
+            r"на русском",
+            r"на английском",
+            r"переведи",
+            r"перефразируй",
+            r"повтори",
+            r"подробнее",
+            r"первое сообщение",
+            r"первый вопрос",
+            r"о чём (мы|было|был[аи]?)",
+            r"что (мы|я) (спрашивал|говорил|обсуждал|писал)",
+            r"в этой сессии",
+            r"в этом (чате|диалоге|разговоре)",
+            r"ранее",
+            r"выше",
+            # English
+            r"previous (answer|response|message)",
+            r"in (russian|english)",
+            r"translate",
+            r"rephrase",
+            r"repeat",
+            r"more detail",
+            r"first message",
+            r"earlier in (this|our)",
+            r"what did (we|i|you) (talk|discuss|say|ask)",
+        ]
+        return any(re.search(p, t) for p in _FOLLOWUP_PATTERNS)
+
+    @staticmethod
+    def _extract_time_window(text: str) -> Optional[dict]:
+        """Extract a time window from user text based on common time markers."""
+        t = (text or "").lower()
+        today = datetime.now(timezone.utc).date()
+
+        if "сегодня" in t or "today" in t:
+            return {
+                "from": f"{today}T00:00:00Z",
+                "to": f"{today}T23:59:59Z",
+            }
+        if "вчера" in t or "yesterday" in t:
+            d = today - timedelta(days=1)
+            return {"from": f"{d}T00:00:00Z", "to": f"{d}T23:59:59Z"}
+        if "позавчера" in t:
+            d = today - timedelta(days=2)
+            return {"from": f"{d}T00:00:00Z", "to": f"{d}T23:59:59Z"}
+        if "прошлой неделе" in t or "неделю назад" in t or "last week" in t or "a week ago" in t:
+            return {
+                "from": f"{today - timedelta(days=7)}T00:00:00Z",
+                "to": f"{today}T23:59:59Z",
+            }
+        if "прошлом месяце" in t or "месяц назад" in t or "last month" in t or "a month ago" in t:
+            return {
+                "from": f"{today - timedelta(days=30)}T00:00:00Z",
+                "to": f"{today}T23:59:59Z",
+            }
+        # "N дней/недель назад"
+        import re as _re
+        m = _re.search(r"(\d+)\s+(дн|день|дня|дней)\s+назад", t)
+        if m:
+            d = today - timedelta(days=int(m.group(1)))
+            return {"from": f"{d}T00:00:00Z", "to": f"{d}T23:59:59Z"}
+        m = _re.search(r"(\d+)\s+(недел)\S*\s+назад", t)
+        if m:
+            d = today - timedelta(weeks=int(m.group(1)))
+            return {"from": f"{d}T00:00:00Z", "to": f"{today}T23:59:59Z"}
+        return None
+
+    _CONV_MARKERS = (
+        "говорили", "разговаривали", "обсуждали", "общались",
+        "беседовали", "разговор", "диалог", "беседа", "беседу",
+        "обсуждение", "переписк", "чат", "чате",
+        "рассказывал", "писал", "спрашивал", "отвечал",
+        "discuss", "talk", "chat", "conversation", "said", "told",
+        "речь", "тем", "рассказал",
+    )
+    _TIME_MARKERS = (
+        "вчера", "позавчера", "сегодня", "неделю", "месяц",
+        "раньше", "ранее", "прошл", "назад", "до этого",
+        "помнишь", "вспомни", "напомни", "забыл",
+        "yesterday", "today", "last week", "ago", "remember",
+        "earlier", "before", "previous", "prior",
+        "был ", "было ", "были ", "была ",
+    )
+
+    @classmethod
+    def _looks_like_memory_recall(cls, text: str, messages: list | None = None) -> bool:
+        """Semantic check: does the text refer to past conversations?
+
+        Uses word-group intersection, NOT a single regex pattern.
+        The idea: if the text contains BOTH a "conversation" word AND a
+        "past reference" word, it's almost certainly memory_recall.
+
+        Also handles follow-ups: if a recent user message in the conversation
+        was about memory recall (had conv markers), and the current message
+        has a time marker (e.g. "а вчера?"), treat it as memory_recall.
+        """
+        t = (text or "").lower()
+        has_conv = any(m in t for m in cls._CONV_MARKERS)
+        has_time = any(m in t for m in cls._TIME_MARKERS)
+        # Direct "о чём мы..." / "о чём у нас..." pattern
+        has_about_us = ("о чем мы" in t or "о чём мы" in t
+                        or "о чем у нас" in t or "о чём у нас" in t
+                        or "что мы" in t or "what did we" in t
+                        or "do you remember" in t)
+
+        if (has_conv and has_time) or has_about_us:
+            return True
+
+        # Follow-up detection: current message is short and has a time marker
+        # (e.g. "а вчера?", "а на прошлой неделе?"), and a recent user message
+        # in the conversation was about memory recall.
+        if has_time and messages and len(t) < 50:
+            for m in reversed(messages[:-1]):  # skip current message
+                if m.get("role") != "user":
+                    continue
+                prev = m.get("content", "")
+                if isinstance(prev, list):
+                    prev = " ".join(
+                        p.get("text", "") for p in prev
+                        if isinstance(p, dict) and p.get("type") == "text"
+                    )
+                prev = (prev or "").lower()
+                prev_conv = any(mk in prev for mk in cls._CONV_MARKERS)
+                prev_about = ("о чем мы" in prev or "о чём мы" in prev
+                              or "о чем у нас" in prev or "о чём у нас" in prev
+                              or "что мы" in prev or "what did we" in prev)
+                if prev_conv or prev_about:
+                    return True
+                break  # only check the most recent user message
+
+        return False
+
+    async def _llm_classify(
+        self, detected: DetectedInput, messages: list | None = None
+    ) -> tuple[str, str, Optional[dict]]:
+        """Return (kind, model, time_window) for pure-text requests. Falls back safely on error."""
         fallback_kind = "ru_chat" if detected.lang == "ru" else "general"
         fallback_model = (
             self.valves.default_ru_model
@@ -397,31 +649,76 @@ class Pipe:
         )
 
         if not detected.last_user_text.strip():
-            return fallback_kind, fallback_model
+            return fallback_kind, fallback_model, None
 
+        today = datetime.now(timezone.utc).date().isoformat()
         system = (
+            f"Current date: {today}\n"
             "You are a router. Classify the user request and return a JSON object "
             'with fields: {"intents": [...], "lang": "ru"|"en"|"other", '
             '"complexity": "trivial"|"normal"|"hard", "primary_model": "mws/...", '
-            '"reason": "<one sentence>"}. '
-            "Valid intents: code, math, ru_chat, general, long_doc, deep_research, presentation. "
+            '"reason": "<one sentence>", "time_window": {"from":"<ISO>","to":"<ISO>"}}. '
+            "Valid intents: code, math, ru_chat, general, long_doc, deep_research, "
+            "presentation, memory_recall. "
             "Valid primary_model: mws/gpt-alpha, mws/qwen3-235b, mws/qwen3-coder, "
             "mws/deepseek-r1-32b, mws/glm-4.6, mws/kimi-k2, mws/llama-3.1-8b. "
-            "Examples: "
+            "\n\nCRITICAL RULE — memory_recall:\n"
+            "If the user asks ANYTHING about past conversations, prior dialogs, "
+            "previously discussed topics, what they told you before, or what "
+            "happened in an earlier session — intent MUST be memory_recall. "
+            "This includes ALL semantic variations, not just specific keywords. "
+            "Examples of memory_recall (do NOT classify these as ru_chat/general): "
+            "'о чём мы говорили', 'о чём был разговор', 'какая была тема', "
+            "'что мы обсуждали', 'помнишь, что я рассказывал', 'вспомни наш диалог', "
+            "'про что шла речь', 'о чём я тебя спрашивал', 'какая была тема нашего "
+            "позавчерашнего разговора', 'что было вчера в чате', 'what did we discuss', "
+            "'do you remember our chat', 'what was our last topic'. "
+            "If the user also mentions a time marker (вчера, позавчера, 3 months ago, "
+            "last week, неделю назад, месяц назад), ALSO return "
+            'time_window: {"from":"<ISO-8601>","to":"<ISO-8601>"} relative to the '
+            "current date above (use a sensible window: for 'yesterday'/'вчера' — full "
+            "previous day; for 'last week' — previous 7 days; for 'N months ago' — "
+            "a ±15-day window around that date). Otherwise omit time_window.\n\n"
+            "Other intents examples: "
             '"write fibonacci in rust" -> {"intents":["code"],"primary_model":"mws/qwen3-coder",...}; '
             '"Провести глубокое исследование рынка EV" -> {"intents":["deep_research"],"primary_model":"mws/kimi-k2",...}; '
             '"Сделай презентацию про Python" -> {"intents":["presentation"],"primary_model":"mws/gpt-alpha",...}; '
-            '"Привет, как дела?" -> {"intents":["ru_chat"],"primary_model":"mws/qwen3-235b",...}.'
+            '"Привет, как дела?" -> {"intents":["ru_chat"],"primary_model":"mws/qwen3-235b",...}; '
+            '"о чём мы говорили неделю назад" -> {"intents":["memory_recall"],"lang":"ru","time_window":{"from":"2026-04-01T00:00:00Z","to":"2026-04-08T23:59:59Z"}}; '
+            '"какая была тема позавчерашнего разговора" -> {"intents":["memory_recall"],"lang":"ru","time_window":{"from":"2026-04-10T00:00:00Z","to":"2026-04-10T23:59:59Z"}}; '
+            '"о чём был разговор вчера" -> {"intents":["memory_recall"],"lang":"ru","time_window":{"from":"2026-04-11T00:00:00Z","to":"2026-04-11T23:59:59Z"}}; '
+            '"о чём мы сегодня разговаривали" -> {"intents":["memory_recall"],"lang":"ru","time_window":{"from":"2026-04-12T00:00:00Z","to":"2026-04-12T23:59:59Z"}}.'
         )
+        # Build classifier input: include recent conversation context so
+        # the classifier can understand follow-up messages like "а вчера?"
+        # after a memory_recall question.
+        classifier_msgs: list[dict] = [{"role": "system", "content": system}]
+        if messages and len(messages) > 1:
+            # Include last few turns (up to 6 messages) for context,
+            # but truncate each to keep token usage low.
+            recent = messages[-6:]
+            for m in recent[:-1]:  # all except last (added separately)
+                role = m.get("role", "user")
+                text = m.get("content", "")
+                if isinstance(text, list):
+                    text = " ".join(
+                        p.get("text", "") for p in text
+                        if isinstance(p, dict) and p.get("type") == "text"
+                    )
+                if role in ("user", "assistant") and text.strip():
+                    classifier_msgs.append(
+                        {"role": role, "content": text[:300]}
+                    )
+        classifier_msgs.append(
+            {"role": "user", "content": detected.last_user_text[:2000]}
+        )
+
         try:
             resp = await self._call_litellm(
                 model=self.valves.classifier_model,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": detected.last_user_text[:2000]},
-                ],
+                messages=classifier_msgs,
                 temperature=0,
-                max_tokens=200,
+                max_tokens=250,
                 response_format={"type": "json_object"},
             )
             content = (
@@ -431,11 +728,12 @@ class Pipe:
         except Exception as e:
             if self.valves.debug:
                 print(f"[mws-auto] classifier error: {e}")
-            return fallback_kind, fallback_model
+            return fallback_kind, fallback_model, None
 
         intents = data.get("intents") or []
         primary_model = data.get("primary_model") or fallback_model
         intent = intents[0] if intents else fallback_kind
+
         # Map intent → subagent kind
         kind_map = {
             "code": "code",
@@ -445,6 +743,7 @@ class Pipe:
             "long_doc": "long_doc",
             "deep_research": "deep_research",
             "presentation": "presentation",
+            "memory_recall": "memory_recall",
         }
         kind = kind_map.get(intent, fallback_kind)
         # Lang-aware override: gpt-oss-20b frequently returns intent="general"
@@ -455,7 +754,15 @@ class Pipe:
             kind = "ru_chat"
             if primary_model in ("mws/gpt-alpha", fallback_model):
                 primary_model = self.valves.default_ru_model
-        return kind, primary_model
+        tw = data.get("time_window")
+        if isinstance(tw, dict) and (tw.get("from") or tw.get("to")):
+            time_window: Optional[dict] = {
+                "from": tw.get("from"),
+                "to": tw.get("to"),
+            }
+        else:
+            time_window = None
+        return kind, primary_model, time_window
 
     # ------------------------------------------------------------------
     # Routing-decision block
@@ -557,6 +864,7 @@ class Pipe:
             "doc_qa": self._sa_doc_qa,
             "deep_research": self._sa_deep_research,
             "presentation": self._sa_presentation,
+            "memory_recall": self._sa_memory_recall,
         }
         handler = dispatch.get(task.kind)
         if handler is None:
@@ -590,6 +898,7 @@ class Pipe:
         detected: DetectedInput,
         messages: list,
         trace_id: str,
+        user_id: Optional[str] = None,
     ) -> list[CompactResult]:
         """If sa_stt ran and there is no chat/text subagent yet, re-plan from transcript."""
         stt_result = next(
@@ -605,16 +914,23 @@ class Pipe:
         if has_chat:
             return results
         transcript = stt_result.summary
-        # Build synthetic DetectedInput from transcript
+        # Build synthetic DetectedInput from transcript.
+        # Preserve the ORIGINAL request language (detected.lang) when the user
+        # wrote an explicit prompt like "Summarize this audio".  Only override
+        # to transcript language when the user sent no text (audio-only).
         synth = DetectedInput(last_user_text=transcript, lang=detected.lang)
-        letters = [c for c in transcript if c.isalpha()]
-        if letters:
-            cyr = sum(1 for c in letters if _CYRILLIC_RE.match(c))
-            synth.lang = "ru" if (cyr / len(letters)) > 0.3 else "en"
+        if not detected.last_user_text.strip():
+            # Audio-only (no user text) — infer lang from transcript
+            letters = [c for c in transcript if c.isalpha()]
+            if letters:
+                cyr = sum(1 for c in letters if _CYRILLIC_RE.match(c))
+                synth.lang = "ru" if (cyr / len(letters)) > 0.3 else "en"
         synth.urls = _URL_RE.findall(transcript)
         synth.wants_image_gen = bool(_IMAGE_GEN_RE.search(transcript))
         synth.wants_web_search = bool(_WEB_SEARCH_RE.search(transcript))
-        new_plan = await self._classify_and_plan(synth, messages)
+        new_plan = await self._classify_and_plan(
+            synth, messages, user_id=user_id
+        )
         # Skip duplicates already handled
         existing_kinds = {r.kind for r in results}
         new_plan = [t for t in new_plan if t.kind not in existing_kinds]
@@ -659,17 +975,40 @@ class Pipe:
             "субагентов. Используй их как факты. Не показывай пользователю внутреннюю "
             "кухню и не дублируй служебные теги вроде [sa_*]. "
             "Если среди результатов есть ошибки — кратко упомяни, но продолжи отвечать. "
-            "Если есть artifacts (изображения) — они будут добавлены в сообщение после "
-            "твоего ответа, можешь их анонсировать одной строкой. "
+            "Если есть artifacts (изображения) — они будут добавлены автоматически после "
+            "твоего ответа. НИКОГДА не вставляй markdown-ссылки на изображения (![...](...)). "
+            "Просто скажи одной строкой, что изображение сгенерировано. "
+            "Если в результатах субагентов есть 'Citations:', обязательно вставь "
+            "ссылки в текст как пронумерованные цитаты [1], [2], [3] и перечисли "
+            "их в конце ответа в формате: [1] URL, [2] URL и т.д. "
+            "ВАЖНО: ты получаешь полную историю диалога. Если пользователь спрашивает "
+            "о предыдущих сообщениях, содержании беседы, или просит переформулировать/"
+            "перевести предыдущий ответ — используй историю диалога, а НЕ результаты "
+            "субагентов. Результаты субагентов полезны только для нового контента "
+            "(поиск, fetch, генерация). "
             f"{lang_instr}\n\n--- SUBAGENT RESULTS ---\n{scratchpad}"
         )
 
-        # Keep the user's most recent message as the final user turn
-        user_msg = self._last_user_message(messages)
-        final_messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_msg},
-        ]
+        # Pass conversation history so the aggregator understands context
+        # (e.g. "translate previous answer", "now in Russian", follow-ups)
+        final_messages = [{"role": "system", "content": system_prompt}]
+        # Include up to last 10 messages (user + assistant turns) for context
+        history = (messages or [])[-10:]
+        for msg in history:
+            role = (msg or {}).get("role", "")
+            if role not in ("user", "assistant"):
+                continue
+            content = msg.get("content")
+            if isinstance(content, list):
+                # Flatten multimodal content to text only
+                text_parts = [
+                    i.get("text", "")
+                    for i in content
+                    if isinstance(i, dict) and i.get("type") == "text"
+                ]
+                content = "\n".join(text_parts)
+            if isinstance(content, str) and content.strip():
+                final_messages.append({"role": role, "content": content})
 
         try:
             async for chunk in self._call_litellm_stream(
@@ -810,6 +1149,13 @@ class Pipe:
     # Multimodal subagents
     # ------------------------------------------------------------------
 
+    _VISION_BLIND_RE = re.compile(
+        r"(?i)(i\s+(don't|do not|cannot|can't)\s+see\s+(an?\s+)?image|"
+        r"no\s+image\s+(was\s+)?(provided|attached|shared)|"
+        r"не\s+вижу\s+(изображени|картинк)|"
+        r"изображение\s+не\s+(предоставлено|прикреплено))"
+    )
+
     async def _sa_vision(self, task: SubTask) -> CompactResult:
         content: list[dict] = [
             {"type": "text", "text": task.input_text or "Опиши изображение."}
@@ -826,15 +1172,38 @@ class Pipe:
             return CompactResult(
                 kind="vision", error="no image attachment available"
             )
-        resp = await self._call_litellm(
-            model=task.model or "mws/cotype-pro-vl",
-            messages=[{"role": "user", "content": content}],
-            temperature=0.3,
-            max_tokens=task.max_output_tokens or 500,
+
+        primary = task.model or "mws/cotype-pro-vl"
+        # cotype-pro-vl is proven working in smoke tests; use it as fallback
+        # whenever the primary silently drops the image.
+        fallback = (
+            "mws/cotype-pro-vl" if primary != "mws/cotype-pro-vl" else "mws/qwen3-vl"
         )
-        text = (
-            resp.get("choices", [{}])[0].get("message", {}).get("content") or ""
-        ).strip()
+
+        async def _call(model: str) -> str:
+            resp = await self._call_litellm(
+                model=model,
+                messages=[{"role": "user", "content": content}],
+                temperature=0.3,
+                max_tokens=task.max_output_tokens or 500,
+            )
+            return (
+                resp.get("choices", [{}])[0].get("message", {}).get("content") or ""
+            ).strip()
+
+        text = await _call(primary)
+        if not text or self._VISION_BLIND_RE.search(text):
+            try:
+                retry_text = await _call(fallback)
+                if retry_text and not self._VISION_BLIND_RE.search(retry_text):
+                    return CompactResult(
+                        kind="vision",
+                        summary=self._truncate_tokens(retry_text, 500),
+                        metadata={"primary": primary, "used": fallback},
+                    )
+            except Exception:
+                pass
+
         return CompactResult(kind="vision", summary=self._truncate_tokens(text, 500))
 
     async def _sa_stt(self, task: SubTask) -> CompactResult:
@@ -845,12 +1214,25 @@ class Pipe:
 
         audio_bytes: Optional[bytes] = None
         filename = att.get("name") or att.get("filename") or "audio.mp3"
-        if att.get("data"):
+
+        # 1. Local file path (injected by inlet filter from OpenWebUI uploads)
+        local_path = att.get("path", "")
+        if local_path:
+            import os
+            if os.path.isfile(local_path):
+                try:
+                    with open(local_path, "rb") as fp:
+                        audio_bytes = fp.read()
+                except Exception as e:
+                    return CompactResult(kind="stt", error=f"read local file: {e}")
+        # 2. Base64-encoded data
+        if not audio_bytes and att.get("data"):
             try:
                 audio_bytes = base64.b64decode(att["data"])
             except Exception as e:
                 return CompactResult(kind="stt", error=f"bad base64: {e}")
-        elif att.get("url"):
+        # 3. URL download
+        if not audio_bytes and att.get("url"):
             url = att["url"]
             async with httpx.AsyncClient(timeout=self.valves.request_timeout) as cli:
                 r = await cli.get(url)
@@ -909,9 +1291,36 @@ class Pipe:
     # ------------------------------------------------------------------
 
     async def _fetch_url_text(self, url: str) -> str:
-        headers = {"User-Agent": "Mozilla/5.0 MWS-GPT-Hub"}
+        # Wikipedia: use REST API to avoid 403 scraping blocks
+        wiki_match = re.match(
+            r"https?://(\w+)\.wikipedia\.org/wiki/(.+)", url
+        )
+        if wiki_match:
+            lang, article = wiki_match.group(1), wiki_match.group(2)
+            api_url = f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{article}"
+            headers = {
+                "User-Agent": "MWS-GPT-Hub/1.0 (https://gpt.mws.ru; admin@mws.ru)"
+            }
+            async with httpx.AsyncClient(
+                timeout=15, headers=headers, follow_redirects=True
+            ) as cli:
+                r = await cli.get(api_url)
+                if r.status_code == 200:
+                    data = r.json()
+                    return data.get("extract", "")[:6000]
+                # Fall through to regular fetch if API fails
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        }
         async with httpx.AsyncClient(
-            timeout=10, headers=headers, follow_redirects=True
+            timeout=15, headers=headers, follow_redirects=True
         ) as cli:
             r = await cli.get(url)
             r.raise_for_status()
@@ -965,31 +1374,49 @@ class Pipe:
         )
 
     async def _ddg_search(self, query: str, n: int = 3) -> list[dict]:
-        """Lightweight DuckDuckGo HTML search. Returns [{title,url,snippet}]."""
-        url = "https://duckduckgo.com/html/"
-        headers = {"User-Agent": "Mozilla/5.0 MWS-GPT-Hub"}
+        """Lightweight DuckDuckGo Lite search. Returns [{title,url,snippet}]."""
+        url = "https://lite.duckduckgo.com/lite/"
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            )
+        }
         async with httpx.AsyncClient(
-            timeout=10, headers=headers, follow_redirects=True
+            timeout=15, headers=headers, follow_redirects=True
         ) as cli:
             r = await cli.post(url, data={"q": query})
             r.raise_for_status()
             html = r.text
-        # Very small HTML parser — targets DuckDuckGo HTML results layout
-        results: list[dict] = []
-        for m in re.finditer(
-            r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>'
-            r'[\s\S]*?<a[^>]+class="result__snippet"[^>]*>(.*?)</a>',
-            html,
-        ):
-            href, title, snippet = m.group(1), m.group(2), m.group(3)
-            title = re.sub(r"<[^>]+>", "", title).strip()
-            snippet = re.sub(r"<[^>]+>", "", snippet).strip()
-            if href.startswith("//duckduckgo.com/l/?uddg="):
-                import urllib.parse as _u
+        # DDG Lite: each result is a pair of <tr> rows:
+        #   <a class='result-link' href="...">title</a>
+        #   <td class='result-snippet'>snippet text</td>
+        import html as _html
 
-                parsed = _u.parse_qs(href.split("?", 1)[1])
-                real = parsed.get("uddg", [href])[0]
-                href = _u.unquote(real)
+        results: list[dict] = []
+        links = list(
+            re.finditer(
+                r"<a[^>]+href=['\"]([^'\"]+)['\"][^>]+class=['\"]result-link['\"][^>]*>(.*?)</a>",
+                html,
+                re.DOTALL,
+            )
+        )
+        snippets = list(
+            re.finditer(
+                r"<td[^>]+class=['\"]result-snippet['\"][^>]*>(.*?)</td>",
+                html,
+                re.DOTALL,
+            )
+        )
+        for i, link_m in enumerate(links):
+            href = link_m.group(1).strip()
+            title = re.sub(r"<[^>]+>", "", link_m.group(2)).strip()
+            title = _html.unescape(title)
+            snippet = ""
+            if i < len(snippets):
+                snippet = re.sub(r"<[^>]+>", "", snippets[i].group(1)).strip()
+                snippet = _html.unescape(snippet)
             results.append({"title": title, "url": href, "snippet": snippet})
             if len(results) >= n:
                 break
@@ -1081,6 +1508,16 @@ class Pipe:
         if context:
             user_msg = f"{user_msg}\n\n--- DOCUMENT ---\n{context}"
 
+        # Focus the LLM on the specific document(s) from this message
+        doc_names = task.metadata.get("doc_names") or []
+        focus_hint = ""
+        if doc_names:
+            names_str = ", ".join(f'"{n}"' for n in doc_names)
+            focus_hint = (
+                f" Документ(ы) из текущего сообщения: {names_str}. "
+                "Отвечай ТОЛЬКО по этому документу, игнорируй контекст "
+                "из других документов/источников."
+            )
         resp = await self._call_litellm(
             model=task.model or "mws/glm-4.6",
             messages=[
@@ -1090,6 +1527,7 @@ class Pipe:
                         "Отвечай на вопрос по предоставленному документу. "
                         "Цитируй разделы/страницы, если указаны. "
                         "Если ответа в документе нет — скажи прямо."
+                        + focus_hint
                     ),
                 },
                 {"role": "user", "content": user_msg[:150_000]},
@@ -1108,6 +1546,58 @@ class Pipe:
             kind="doc_qa",
             summary=self._truncate_tokens(text, 500),
             citations=citations,
+        )
+
+    # ------------------------------------------------------------------
+    # Memory recall
+    # ------------------------------------------------------------------
+
+    async def _sa_memory_recall(self, task: SubTask) -> CompactResult:
+        user_id = task.metadata.get("user_id")
+        if not user_id:
+            return CompactResult(
+                kind="memory_recall",
+                summary="",
+                error="memory_recall: no user_id in metadata",
+            )
+        payload: dict = {
+            "user_id": user_id,
+            "query": task.input_text,
+            "limit": 5,
+        }
+        tw = task.metadata.get("time_window") or {}
+        if tw.get("from"):
+            payload["date_from"] = tw["from"]
+        if tw.get("to"):
+            payload["date_to"] = tw["to"]
+        try:
+            async with httpx.AsyncClient(timeout=15) as cli:
+                r = await cli.post(
+                    "http://memory-service:8000/episodes/recall",
+                    json=payload,
+                )
+                r.raise_for_status()
+                episodes = r.json()
+        except Exception as e:
+            return CompactResult(
+                kind="memory_recall",
+                summary="",
+                error=f"memory_recall request failed: {e}",
+            )
+        if not episodes:
+            return CompactResult(
+                kind="memory_recall",
+                summary="В истории диалогов ничего не найдено по этому запросу.",
+            )
+        lines: list[str] = []
+        for ep in episodes:
+            date = (ep.get("turn_end_at") or "")[:10]
+            lines.append(f"- [{date}] {(ep.get('summary') or '').strip()}")
+        body = "Найденные эпизоды из прошлых диалогов:\n" + "\n".join(lines)
+        return CompactResult(
+            kind="memory_recall",
+            summary=self._truncate_tokens(body, 500),
+            citations=[ep.get("chat_id") for ep in episodes if ep.get("chat_id")],
         )
 
     # ------------------------------------------------------------------

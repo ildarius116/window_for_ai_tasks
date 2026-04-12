@@ -52,7 +52,23 @@
       "Bash(mkdir -p \"C:/Users/Ildar.Sabirov/.claude/plans\")",
       "Read(//c/Users/Ildar.Sabirov/.claude/plans/**)",
       "Bash(bash -n scripts/deploy_function.sh)",
-      "Bash(rerun:*)"
+      "Bash(rerun:*)",
+      "Bash(findstr \"mws-auto\")",
+      "Bash(tee tmp_logs.txt)",
+      "Bash(tee tmp_logs3.txt)",
+      "Bash(ssh:*)",
+      "Bash(sshpass:*)",
+      "Bash(expect:*)",
+      "Bash(where sshpass:*)",
+      "Read(//usr/bin/**)",
+      "Read(//usr/local/bin/**)",
+      "Read(//c/Program Files/**)",
+      "Read(//c/ProgramData/chocolatey/bin/**)",
+      "Bash(powershell.exe -Command \"Get-Command sshpass -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source\")",
+      "Bash(choco list:*)",
+      "Bash(cmd:*)",
+      "Bash(break)",
+      "Bash(bash scripts/deploy_function.sh pipelines/auto_router_function.py)"
     ]
   }
 }

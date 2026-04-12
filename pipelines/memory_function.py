@@ -7,6 +7,7 @@ description: Injects relevant user memories into context and extracts new memori
 
 import json
 import urllib.request
+from datetime import datetime, timezone
 from typing import Optional
 
 from pydantic import BaseModel, Field
@@ -46,8 +47,77 @@ class Filter:
             print(f"[MWS Memory] Error: {e}")
             return {}
 
+    _AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".webm"}
+    _DOC_EXTS = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+                 ".txt", ".csv", ".md", ".rtf", ".odt"}
+
+    @classmethod
+    def _inject_file_tags(cls, body: dict) -> None:
+        """Inject <mws_audio_files> / <mws_doc_files> tags into the last user message.
+
+        OpenWebUI provides body["files"] to inlet filters but strips them
+        before calling pipe functions.  By embedding file metadata directly
+        into the message text, the auto-router pipe can detect uploads
+        and route to the correct subagent (STT for audio, doc_qa for docs).
+        """
+        # Use files from the CURRENT message (parent_message.files), not
+        # body["files"] which accumulates all files across the entire chat.
+        metadata = body.get("metadata") or {}
+        parent_msg = metadata.get("parent_message") or {}
+        files = parent_msg.get("files") or []
+        if not files:
+            files = body.get("files") or []
+
+        audio_files = []
+        doc_files = []
+        for f in files:
+            inner = f.get("file", {}) if isinstance(f, dict) else {}
+            meta = inner.get("meta", {})
+            ct = meta.get("content_type", "") or f.get("content_type", "")
+            fname = meta.get("name", "") or f.get("name", "")
+            fid = inner.get("id", "") or f.get("id", "")
+            path = inner.get("path", "")
+            fname_lower = fname.lower() if fname else ""
+
+            is_audio = ct.startswith("audio/") or any(
+                fname_lower.endswith(ext) for ext in cls._AUDIO_EXTS
+            )
+            is_doc = ct.startswith("application/pdf") or ct.startswith("text/") or any(
+                fname_lower.endswith(ext) for ext in cls._DOC_EXTS
+            )
+
+            entry = {"id": fid, "filename": fname, "path": path, "content_type": ct}
+            if is_audio:
+                audio_files.append(entry)
+            elif is_doc:
+                doc_files.append(entry)
+
+        tags = ""
+        if audio_files:
+            tags += "<mws_audio_files>" + json.dumps(audio_files) + "</mws_audio_files>"
+        if doc_files:
+            tags += "<mws_doc_files>" + json.dumps(doc_files) + "</mws_doc_files>"
+        if not tags:
+            return
+
+        messages = body.get("messages", [])
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    msg["content"] = (content + "\n" + tags) if content else tags
+                elif isinstance(content, list):
+                    content.append({"type": "text", "text": tags})
+                break
+
     def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
-        """Inject relevant memories into the system prompt before sending to LLM."""
+        """Inject relevant memories and audio file metadata before sending to LLM."""
+        # --- Pass audio/document file metadata through to pipe via message tag ---
+        # OpenWebUI strips body["files"] before calling pipe functions, but the
+        # auto-router needs to know about uploaded audio.  Inject a hidden tag
+        # into the last user message so _detect() can pick it up.
+        self._inject_file_tags(body)
+
         if not self.valves.enabled or not __user__:
             return body
 
@@ -97,7 +167,12 @@ class Filter:
         body["messages"] = messages
         return body
 
-    def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
+    def outlet(
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        __metadata__: Optional[dict] = None,
+    ) -> dict:
         """Extract memories from the conversation after LLM response."""
         if not self.valves.enabled or not __user__:
             return body
@@ -115,12 +190,67 @@ class Filter:
 
         # Send last messages for extraction
         recent = messages[-8:] if len(messages) > 8 else messages
-        chat_id = body.get("chat_id", "unknown")
+        chat_id = (
+            body.get("chat_id")
+            or (__metadata__ or {}).get("chat_id")
+            or "unknown"
+        )
 
         self._request("POST", "/memories/extract", {
             "user_id": user_id,
             "chat_id": chat_id,
             "messages": recent,
         })
+
+        # Also write a conversation episode (summary + embedding). Errors
+        # here must NOT break the chat — swallow and log to debug only.
+        try:
+            window_size = len(recent)
+            total = len(messages)
+            clean_msgs = []
+            timestamps: list = []
+            for m in recent:
+                role = m.get("role") or ""
+                content = m.get("content")
+                if isinstance(content, list):
+                    # Strip attachments / non-text parts
+                    content = "\n".join(
+                        (p.get("text") or "")
+                        for p in content
+                        if isinstance(p, dict) and p.get("type") == "text"
+                    )
+                elif not isinstance(content, str):
+                    content = str(content or "")
+                clean_msgs.append({"role": role, "content": content})
+                ts = m.get("timestamp") or m.get("created_at")
+                if ts:
+                    timestamps.append(ts)
+
+            if timestamps:
+                turn_start_at = min(timestamps)
+                turn_end_at = max(timestamps)
+                if isinstance(turn_start_at, (int, float)):
+                    turn_start_at = datetime.fromtimestamp(
+                        turn_start_at, tz=timezone.utc
+                    ).isoformat()
+                if isinstance(turn_end_at, (int, float)):
+                    turn_end_at = datetime.fromtimestamp(
+                        turn_end_at, tz=timezone.utc
+                    ).isoformat()
+            else:
+                now_iso = datetime.now(timezone.utc).isoformat()
+                turn_start_at = now_iso
+                turn_end_at = now_iso
+
+            self._request("POST", "/episodes", {
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "messages": clean_msgs,
+                "message_indices": [total - window_size, total],
+                "turn_start_at": turn_start_at,
+                "turn_end_at": turn_end_at,
+            })
+        except Exception as e:
+            print(f"[MWS Memory] episodes write skipped: {e}")
 
         return body

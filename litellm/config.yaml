@@ -97,21 +97,30 @@ model_list:
       api_base: https://api.gpt.mws.ru/v1
 
   # --- MWS GPT: embeddings ---
+  # NOTE: MWS GPT upstream requires explicit encoding_format: "float" in the
+  # request body — without it the API returns HTTP 400.  extra_body injects it
+  # into every proxy request so both OpenWebUI RAG and Memory Service work.
   - model_name: mws/bge-m3
     litellm_params:
       model: openai/bge-m3
       api_key: os.environ/MWS_GPT_API_KEY
       api_base: https://api.gpt.mws.ru/v1
+      extra_body:
+        encoding_format: "float"
   - model_name: mws/bge-gemma2
     litellm_params:
       model: openai/BAAI/bge-multilingual-gemma2
       api_key: os.environ/MWS_GPT_API_KEY
       api_base: https://api.gpt.mws.ru/v1
+      extra_body:
+        encoding_format: "float"
   - model_name: mws/qwen3-embedding
     litellm_params:
       model: openai/qwen3-embedding-8b
       api_key: os.environ/MWS_GPT_API_KEY
       api_base: https://api.gpt.mws.ru/v1
+      extra_body:
+        encoding_format: "float"
 
   # --- MWS GPT: audio (whisper) ---
   - model_name: mws/whisper-medium
