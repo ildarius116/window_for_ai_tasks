@@ -1,6 +1,9 @@
-.PHONY: up down ps logs build gen-secrets setup prod backup restore deploy-functions
+.PHONY: up down ps logs build gen-secrets gen-ssl setup prod backup restore deploy-functions
 
-up:
+gen-ssl:
+	@bash scripts/gen-selfsigned-cert.sh
+
+up: gen-ssl
 	docker compose up -d
 
 down:
@@ -38,7 +41,7 @@ setup: up
 	@echo "Run scripts/setup-models.sh after creating admin account in OpenWebUI"
 	@echo "Open http://localhost:3000 to create admin account"
 
-prod:
+prod: gen-ssl
 	docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 
 backup:

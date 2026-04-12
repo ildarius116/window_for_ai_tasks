@@ -236,10 +236,10 @@ services:
     image: nginx:alpine
     ports:
       - "80:80"
-      # - "443:443"  # Uncomment when HTTPS is enabled
+      - "443:443"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      # - ./nginx/ssl:/etc/nginx/ssl:ro  # Uncomment for HTTPS certificates
+      - ./nginx/ssl:/etc/nginx/ssl:ro
     depends_on:
       - openwebui
     restart: unless-stopped
