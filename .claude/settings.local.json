@@ -72,7 +72,8 @@
       "Bash(bash scripts/gen-selfsigned-cert.sh)",
       "Bash(rm -f nginx/ssl/*.pem)",
       "Bash(openssl req:*)",
-      "Bash(iconv -f cp1251 -t utf-8)"
+      "Bash(iconv -f cp1251 -t utf-8)",
+      "Bash(rerun: b5:*)"
     ]
   }
 }
