@@ -500,6 +500,17 @@ class Pipe:
         ):
             kind = "memory_recall"
 
+        # Same pattern for web_search: if the classifier missed a real-time
+        # info question (weather/news/rates/scores), override via word-group
+        # intersection safety net. Common failure mode: 20b classifier gets
+        # distracted by prior conversation context and returns ru_chat/general
+        # for a fresh weather question.
+        if kind not in ("web_search", "memory_recall") and self._looks_like_web_search(
+            detected.last_user_text
+        ):
+            kind = "web_search"
+            model = "mws/kimi-k2"
+
         # If routed to memory_recall but no time_window from classifier,
         # try to extract one from the user text.
         if kind == "memory_recall" and not time_window:
@@ -660,6 +671,52 @@ class Pipe:
 
         return False
 
+    # Word groups for web_search safety net.
+    # STRONG markers: inherently real-time, fire on their own (no time marker
+    # needed). "погода" almost always means "current weather"; "новости" means
+    # "recent news"; "последние" as a bare adjective is a strong signal too.
+    _WEB_STRONG_MARKERS = (
+        "погод", "weather", "прогноз погод",
+        "новост", "news", "latest news", "последние",
+        "что нового", "what's new", "whats new",
+    )
+    # TOPIC markers: volatile facts that MIGHT be historical (prices can be
+    # queried for a past date). Need a real-time marker to fire.
+    _WEB_TOPIC_MARKERS = (
+        "температур",
+        "курс", "exchange rate", "rate of", "цена", "цены", "стоимост", "price", "prices",
+        "событи",
+        "счёт", "счет", "матч", "score", "won", "выиграл", "проиграл",
+        "рейс", "flight", "пробк", "traffic",
+        "акци", "stock", "биткоин", "bitcoin", "btc",
+        "дожд", "снег", "ветер", "давление",
+    )
+    # Real-time markers: "now / today / current" in both languages.
+    _WEB_NOW_MARKERS = (
+        "сегодня", "сейчас", "актуальн", "текущ", "нынешн",
+        "today", "now", "current", "latest", "right now", "at the moment",
+    )
+
+    @classmethod
+    def _looks_like_web_search(cls, text: str) -> bool:
+        """Semantic check: does the text ask for real-time/current info?
+
+        Word-group intersection (NOT a primary gate — runs AFTER the LLM
+        classifier as a safety net, same pattern as _looks_like_memory_recall).
+        Fires when the text contains BOTH a "volatile topic" word AND a
+        "real-time" marker — e.g. "какая сегодня погода" (погода + сегодня),
+        "курс доллара сейчас" (курс + сейчас). Without a time marker, a bare
+        "курс доллара" is ambiguous and falls through to the LLM classifier.
+        """
+        t = (text or "").lower()
+        if not t:
+            return False
+        if any(m in t for m in cls._WEB_STRONG_MARKERS):
+            return True
+        has_topic = any(m in t for m in cls._WEB_TOPIC_MARKERS)
+        has_now = any(m in t for m in cls._WEB_NOW_MARKERS)
+        return has_topic and has_now
+
     async def _llm_classify(
         self, detected: DetectedInput, messages: list | None = None
     ) -> tuple[str, str, Optional[dict]]:
@@ -682,10 +739,27 @@ class Pipe:
             '"complexity": "trivial"|"normal"|"hard", "primary_model": "mws/...", '
             '"reason": "<one sentence>", "time_window": {"from":"<ISO>","to":"<ISO>"}}. '
             "Valid intents: code, math, ru_chat, general, long_doc, deep_research, "
-            "presentation, memory_recall. "
+            "presentation, memory_recall, web_search. "
             "Valid primary_model: mws/gpt-alpha, mws/qwen3-235b, mws/qwen3-coder, "
             "mws/deepseek-r1-32b, mws/glm-4.6, mws/kimi-k2, mws/llama-3.1-8b. "
-            "\n\nCRITICAL RULE — memory_recall:\n"
+            "\n\nCRITICAL RULE — web_search:\n"
+            "If the request needs REAL-TIME or CURRENT information that the model "
+            "cannot know from training data — intent MUST be web_search, regardless "
+            "of whether the user said 'найди'/'поищи'/'search'. This covers ALL "
+            "semantic variations. Triggers include: weather ('какая погода', "
+            "'what's the weather'), news and current events ('что случилось', "
+            "'latest news'), exchange rates and prices ('курс доллара', 'цена "
+            "биткоина', 'stock price'), sports scores, flight/traffic status, "
+            "'кто выиграл', 'who won', 'что сейчас с X', and any question with "
+            "'сегодня'/'сейчас'/'today'/'now'/'current' about facts outside the "
+            "model's knowledge. Do NOT classify these as ru_chat/general — the "
+            "model will hallucinate or refuse. Examples: "
+            "'какая сегодня погода в москве' -> web_search; "
+            "'узнай курс доллара' -> web_search; "
+            "'что нового с SpaceX' -> web_search; "
+            "'кто выиграл матч вчера' -> web_search. "
+            "Use primary_model mws/kimi-k2 for web_search.\n\n"
+            "CRITICAL RULE — memory_recall:\n"
             "If the user asks ANYTHING about past conversations, prior dialogs, "
             "previously discussed topics, what they told you before, or what "
             "happened in an earlier session — intent MUST be memory_recall. "
@@ -767,6 +841,7 @@ class Pipe:
             "deep_research": "deep_research",
             "presentation": "presentation",
             "memory_recall": "memory_recall",
+            "web_search": "web_search",
         }
         kind = kind_map.get(intent, fallback_kind)
         # Lang-aware override: gpt-oss-20b frequently returns intent="general"
