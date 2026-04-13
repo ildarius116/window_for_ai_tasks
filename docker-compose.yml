@@ -79,6 +79,10 @@ services:
       # the master key via os.getenv("LITELLM_MASTER_KEY") — without this,
       # Pipe calls back to LiteLLM return 401 Unauthorized.
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      # Needed for phase-11 pptx delivery: pipe uploads generated .pptx via
+      # POST /api/v1/files/ using this token. Without it the presentation
+      # subagent falls back to a markdown plan.
+      OWUI_ADMIN_TOKEN: ${OWUI_ADMIN_TOKEN:-}
       WEBUI_SECRET_KEY: ${OPENWEBUI_SECRET_KEY}
       WEBUI_NAME: "MWS GPT"
       DATABASE_URL: postgresql://${POSTGRES_USER:-mws}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-openwebui}
@@ -158,6 +162,28 @@ services:
   tts-service:
     build: ./tts-service
     # Port not exposed to host — accessible only via mws-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - mws-network
+
+  pptx-service:
+    build: ./pptx-service
+    # Port not exposed to host — accessible only via mws-network
+    environment:
+      LITELLM_URL: http://litellm:4000
+      LITELLM_API_KEY: ${LITELLM_MASTER_KEY}
+      SCHEMA_MODEL: mws/glm-4.6
+    depends_on:
+      litellm:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 15s
