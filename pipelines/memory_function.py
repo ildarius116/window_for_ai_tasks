@@ -63,9 +63,19 @@ class Filter:
         before calling pipe functions.  By embedding file metadata directly
         into the message text, the auto-router pipe can detect uploads
         and route to the correct subagent (STT for audio, doc_qa for docs).
+
+        Prefer `metadata.parent_message.files` (attachments bound to the
+        current turn in OpenWebUI's real UI shape). Fall back to
+        `body["files"]` because when a user attaches a file via the live UI
+        and hits Send, OpenWebUI does NOT always populate parent_message.files
+        in the chat-completions body — the attachments live only in the
+        top-level accumulator. Without the fallback, `has_document` stays
+        False on the very turn of upload and `doc_qa` never fires.
+        The "stuck context" problem (URL / image_gen blocked by a stale
+        attachment in body["files"]) is handled one layer up, in
+        `_classify_and_plan`, which now skips doc_qa when the current user
+        text has an explicit image_gen or URL intent.
         """
-        # Use files from the CURRENT message (parent_message.files), not
-        # body["files"] which accumulates all files across the entire chat.
         metadata = body.get("metadata") or {}
         parent_msg = metadata.get("parent_message") or {}
         files = parent_msg.get("files") or []

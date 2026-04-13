@@ -83,6 +83,20 @@ _REASONER_RE = re.compile(
     r"[∀∃∈∉⊂⊆≡⇒⇔])"
 )
 
+# Phase 11 — presentation safety-net markers (applied AFTER _llm_classify, not as primary gate).
+_PPTX_MARKERS = (
+    "презентация", "презентацию", "презентацией", "презентации", "презентаций",
+    "слайды", "слайдов", "слайд ", "слайда", "слайдам", "слайдах",
+    "pptx", "powerpoint", "power point", "keynote", "реферат в слайдах",
+    "представление",
+    "presentation", "slides", "slide deck", "deck",
+)
+
+
+def _looks_like_presentation(text: str) -> bool:
+    t = (text or "").lower()
+    return any(m in t for m in _PPTX_MARKERS)
+
 
 # ---------------------------------------------------------------------------
 # Pipe
@@ -175,16 +189,15 @@ class Pipe:
             art.get("url") for r in results for art in (r.artifacts or [])
         )
         if has_artifacts:
-            # Buffer the full response so we can strip hallucinated image links
+            # Buffer the full response so we can strip hallucinated image/file
+            # markers before the real artifacts are appended by _render_artifacts.
             buf: list[str] = []
             async for chunk in self._stream_aggregate(
                 final_model, messages, results, detected, trace_id=trace_id
             ):
                 buf.append(chunk)
             text = "".join(buf)
-            # Remove markdown image links — real images are appended via _render_artifacts
-            text = re.sub(r"!\[[^\]]*\]\([^\)]+\)", "", text)
-            text = re.sub(r"\n{3,}", "\n\n", text).strip()
+            text = self._scrub_artifact_echoes(text)
             yield text
         else:
             async for chunk in self._stream_aggregate(
@@ -340,6 +353,57 @@ class Pipe:
     ) -> list[SubTask]:
         plan: list[SubTask] = []
 
+        # Phase 11 — presentation wins over doc_qa/long_doc when the user
+        # explicitly asks for slides. Runs BEFORE other short-circuits so an
+        # attached PDF doesn't get routed into doc_qa.
+        if _looks_like_presentation(detected.last_user_text or ""):
+            # On follow-up turns without a fresh attachment (e.g.
+            # "добавь картинки" after a previous presentation was generated),
+            # the new user message alone doesn't carry the topic, and
+            # pptx-service would produce a dec about nothing in particular.
+            # Capture the last few turns as conversation context so the
+            # schema model can understand what is being refined.
+            conv_ctx = ""
+            if not detected.document_attachments and messages and len(messages) > 1:
+                ctx_parts: list[str] = []
+                for m in messages[-6:]:
+                    role = (m or {}).get("role", "")
+                    if role not in ("user", "assistant"):
+                        continue
+                    c = m.get("content", "")
+                    if isinstance(c, list):
+                        c = " ".join(
+                            p.get("text", "") for p in c
+                            if isinstance(p, dict) and p.get("type") == "text"
+                        )
+                    if not isinstance(c, str):
+                        continue
+                    # Strip pipe decoration from prior assistant turns so the
+                    # pptx-service LLM doesn't mistake routing blocks / file
+                    # markers for content to put in slides.
+                    if role == "assistant":
+                        c = self._scrub_assistant_history(c)
+                    c = c.strip()
+                    if not c:
+                        continue
+                    ctx_parts.append(f"[{role}] {c[:600]}")
+                if ctx_parts:
+                    conv_ctx = "\n".join(ctx_parts)
+            return [
+                SubTask(
+                    kind="presentation",
+                    input_text=detected.last_user_text or "",
+                    attachments=list(detected.document_attachments or []),
+                    model="",  # pptx-service chooses the schema model
+                    metadata={
+                        "lang": detected.lang,
+                        "user_id": user_id,
+                        "rule": "presentation_marker",
+                        "conversation_context": conv_ctx,
+                    },
+                )
+            ]
+
         # Short-circuit by rules
         if detected.has_image and not detected.wants_image_gen:
             vision_model = (
@@ -368,7 +432,19 @@ class Pipe:
                 )
             )
 
-        if detected.has_document:
+        # Skip doc_qa when the user's current message has an explicit
+        # non-document intent (image generation or URL fetch with a URL-
+        # dominant message). Otherwise, a file attached many turns ago
+        # (which still lives in body["files"]) forces every follow-up
+        # into doc_qa and blocks the real intent.
+        _url_dominant = bool(detected.urls) and (
+            len(_URL_RE.sub("", detected.last_user_text or "").strip()) <= 60
+        )
+        _skip_doc_qa_for_intent = (
+            detected.wants_image_gen or _url_dominant
+        )
+
+        if detected.has_document and not _skip_doc_qa_for_intent:
             # Include current document filename so doc_qa can focus on it
             doc_names = [
                 a.get("filename") or a.get("name") or "document"
@@ -397,8 +473,13 @@ class Pipe:
         #    link with brief framing like "что здесь?"). Otherwise every
         #    follow-up question in a chat that once cited a URL gets
         #    force-routed to web_fetch.
-        _has_attachment = detected.has_document or detected.has_image or detected.has_audio
-        if detected.urls and not _has_attachment:
+        # Fire web_fetch when the message is URL-dominant. Previously we
+        # skipped it whenever an attachment was present (to dodge RAG-
+        # injected GitHub links from PDFs), but that also blocked legit
+        # URL questions on chats with a stale document. Now the short
+        # `non_url_text <= 60` gate alone is enough: a long document
+        # answer that happens to contain a URL won't trip it.
+        if detected.urls:
             non_url_text = _URL_RE.sub("", detected.last_user_text).strip()
             if len(non_url_text) <= 60:
                 plan.append(
@@ -419,7 +500,7 @@ class Pipe:
                 SubTask(
                     kind="image_gen",
                     input_text=detected.last_user_text,
-                    model="mws/qwen-image",
+                    model="mws/qwen-image-lightning",
                     metadata={"lang": detected.lang, "user_id": user_id},
                 )
             )
@@ -685,7 +766,15 @@ class Pipe:
             "presentation, memory_recall. "
             "Valid primary_model: mws/gpt-alpha, mws/qwen3-235b, mws/qwen3-coder, "
             "mws/deepseek-r1-32b, mws/glm-4.6, mws/kimi-k2, mws/llama-3.1-8b. "
-            "\n\nCRITICAL RULE — memory_recall:\n"
+            "\n\nCRITICAL RULE — presentation:\n"
+            "If the user asks you to create a presentation / slides / deck / pptx / "
+            "powerpoint / представление / презентацию / слайды — intent MUST be "
+            'presentation. Return {"intents":["presentation"], ...} EVEN IF a document '
+            "is attached — do NOT add doc_qa or long_doc in that case. Examples:\n"
+            '  "Сделай презентацию про async/await" → {"intents":["presentation"]}\n'
+            '  "Вот резюме. Сделай из него презентацию." (has_document=true) → {"intents":["presentation"]}\n'
+            '  "Make a 5-slide deck about Python" → {"intents":["presentation"]}\n'
+            "\nCRITICAL RULE — memory_recall:\n"
             "If the user asks ANYTHING about past conversations, prior dialogs, "
             "previously discussed topics, what they told you before, or what "
             "happened in an earlier session — intent MUST be memory_recall. "
@@ -903,9 +992,13 @@ class Pipe:
                 )
             return result
         except Exception as e:
-            if self.valves.debug:
-                print(f"[mws-auto {trace_id[:8]}] sa_{task.kind} failed: {e}")
-            return CompactResult(kind=task.kind, error=str(e))
+            # Log a concise failure line even when debug is off — upstream
+            # timeouts/transport errors are otherwise invisible.
+            print(
+                f"[mws-auto {trace_id[:8]}] sa_{task.kind} FAILED: "
+                f"{type(e).__name__}: {str(e)[:200]}"
+            )
+            return CompactResult(kind=task.kind, error=f"{type(e).__name__}: {e}")
 
     async def _dispatch(
         self, plan: list[SubTask], trace_id: str
@@ -1008,9 +1101,19 @@ class Pipe:
             "субагентов. Используй их как факты. Не показывай пользователю внутреннюю "
             "кухню и не дублируй служебные теги вроде [sa_*]. "
             "Если среди результатов есть ошибки — кратко упомяни, но продолжи отвечать. "
-            "Если есть artifacts (изображения) — они будут добавлены автоматически после "
-            "твоего ответа. НИКОГДА не вставляй markdown-ссылки на изображения (![...](...)). "
-            "Просто скажи одной строкой, что изображение сгенерировано. "
+            "Если у субагентов есть artifacts (сгенерированные файлы или изображения), "
+            "ссылка на них будет автоматически добавлена после твоего текста. "
+            "НИКОГДА не вставляй markdown-ссылки на изображения (![...](...)) и на файлы "
+            "([имя.pptx](...)) — их добавит система. НЕ пиши фраз вида "
+            "«изображение сгенерировано» или «файл приложён»: только краткое содержательное "
+            "резюме того, что было сделано (тема, число слайдов и т.п.). "
+            "НИКОГДА не упоминай и не воспроизводи символ 📎 и блоки "
+            "<details>🎯 Routing decision</details> — это служебная разметка, "
+            "которую добавляет система. Даже если видишь их в истории диалога, "
+            "не копируй их в свой ответ и не выдумывай похожие. "
+            "НЕ упоминай имена файлов из предыдущих ответов — в истории они "
+            "могут быть устаревшими; имя реального артефакта этого хода "
+            "подставит система. "
             "Если в результатах субагентов есть 'Citations:', обязательно вставь "
             "ссылки в текст как пронумерованные цитаты [1], [2], [3] и перечисли "
             "их в конце ответа в формате: [1] URL, [2] URL и т.д. "
@@ -1043,6 +1146,10 @@ class Pipe:
                 ]
                 content = "\n".join(text_parts)
             if isinstance(content, str) and content.strip():
+                if role == "assistant":
+                    content = self._scrub_assistant_history(content)
+                    if not content.strip():
+                        continue
                 final_messages.append({"role": role, "content": content})
 
         try:
@@ -1100,12 +1207,69 @@ class Pipe:
                 )
         return ""
 
+    # ------------------------------------------------------------------
+    # Assistant-history scrubber
+    # ------------------------------------------------------------------
+    #
+    # Prior assistant turns contain two kinds of pipe-generated decoration
+    # that the aggregator tends to copy on follow-ups: the <details>🎯 Routing
+    # decision</details> block yielded at the start of every pipe call, and
+    # the 📎 markdown link appended by _render_artifacts. When the aggregator
+    # sees them in its history it reproduces them in the next response
+    # (sometimes with hallucinated filenames pulled from other contexts —
+    # that is what caused the `strategiya_razvitiya_2024.pptx` ghost).
+    # Strip them both from history AND from the aggregator's own output.
+
+    _DETAILS_BLOCK_RE = re.compile(
+        r"<details>[\s\S]*?</details>\s*", re.IGNORECASE
+    )
+    _PAPERCLIP_LINE_RE = re.compile(r"(?m)^\s*📎[^\n]*$")
+    _FILE_LINK_RE = re.compile(
+        r"\[[^\]]*\]\((?:/api/v1/files/[^)]+|[^)]*\.pptx[^)]*)\)"
+    )
+    _IMAGE_LINK_RE = re.compile(r"!\[[^\]]*\]\([^\)]+\)")
+
+    @classmethod
+    def _scrub_assistant_history(cls, content: str) -> str:
+        """Remove pipe-generated decoration from a prior assistant message
+        before it is passed back to the aggregator as history. Keeps the
+        actual natural-language part of the reply intact."""
+        if not isinstance(content, str) or not content:
+            return content
+        content = cls._DETAILS_BLOCK_RE.sub("", content)
+        content = cls._FILE_LINK_RE.sub("", content)
+        content = cls._IMAGE_LINK_RE.sub("", content)
+        content = cls._PAPERCLIP_LINE_RE.sub("", content)
+        content = re.sub(r"\n{3,}", "\n\n", content).strip()
+        return content
+
+    @classmethod
+    def _scrub_artifact_echoes(cls, text: str) -> str:
+        """Post-stream cleanup of the aggregator's own output when artifacts
+        are present: strip hallucinated image links, file links, 📎 lines and
+        any routing-decision block the model may have mirrored from history."""
+        if not text:
+            return text
+        text = cls._DETAILS_BLOCK_RE.sub("", text)
+        text = cls._IMAGE_LINK_RE.sub("", text)
+        text = cls._FILE_LINK_RE.sub("", text)
+        text = cls._PAPERCLIP_LINE_RE.sub("", text)
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+        return text
+
     def _render_artifacts(self, results: list[CompactResult]) -> str:
         out: list[str] = []
         for r in results:
             for art in r.artifacts or []:
-                if art.get("type") == "image" and art.get("url"):
-                    out.append(f"![generated]({art['url']})")
+                t = art.get("type")
+                url = art.get("url")
+                if not url:
+                    continue
+                if t == "image":
+                    out.append(f"![generated]({url})")
+                elif t == "file":
+                    name = art.get("filename") or "file"
+                    out.append(f"\n📎 [{name}]({url})")
         return "\n".join(out)
 
     # ------------------------------------------------------------------
@@ -1313,14 +1477,41 @@ class Pipe:
     async def _sa_image_gen(self, task: SubTask) -> CompactResult:
         url = f"{self.valves.litellm_base_url.rstrip('/')}/images/generations"
         payload = {
-            "model": task.model or "mws/qwen-image",
+            # Lightning variant renders in ~10–20s on the MWS GPT upstream;
+            # the heavy `mws/qwen-image` routinely exceeds 120s and times
+            # out the pipe, silently killing the artifact.
+            "model": task.model or "mws/qwen-image-lightning",
             "prompt": task.input_text,
             "n": 1,
             "size": "1024x1024",
         }
-        async with httpx.AsyncClient(timeout=self.valves.request_timeout) as cli:
-            r = await cli.post(url, json=payload, headers=self._auth_headers())
-            r.raise_for_status()
+        # 45s is the point past which users notice. The Lightning model
+        # comfortably fits under this when upstream is healthy; when it
+        # is not, failing fast with a clear error beats making the user
+        # wait minutes for nothing.
+        async with httpx.AsyncClient(timeout=45) as cli:
+            try:
+                r = await cli.post(
+                    url, json=payload, headers=self._auth_headers()
+                )
+            except httpx.ReadTimeout:
+                return CompactResult(
+                    kind="image_gen",
+                    error=(
+                        "image gen timed out after 45s — the MWS image "
+                        "backend is currently overloaded. Try again in a "
+                        "minute."
+                    ),
+                )
+            except httpx.HTTPError as e:
+                return CompactResult(
+                    kind="image_gen", error=f"image gen transport: {e}"
+                )
+            if r.status_code != 200:
+                return CompactResult(
+                    kind="image_gen",
+                    error=f"image gen HTTP {r.status_code}: {r.text[:200]}",
+                )
             obj = r.json()
         items = obj.get("data") or []
         if not items:
@@ -1667,13 +1858,191 @@ class Pipe:
             ),
         )
 
+    # ------------------------------------------------------------------
+    # Phase 11 — presentation subagent
+    # ------------------------------------------------------------------
+
+    _PPTX_MIME = (
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    )
+
+    _TRANSLIT_MAP = {
+        "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+        "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+        "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+        "ф": "f", "х": "h", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sch",
+        "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+    }
+
+    @classmethod
+    def _slug(cls, text: str) -> str:
+        t = (text or "").strip().lower()
+        out: list[str] = []
+        for ch in t:
+            if ch in cls._TRANSLIT_MAP:
+                out.append(cls._TRANSLIT_MAP[ch])
+            elif ch.isascii() and (ch.isalnum() or ch in " _-"):
+                out.append(ch)
+            else:
+                out.append(" ")
+        slug = re.sub(r"\W+", "_", "".join(out)).strip("_")
+        return slug[:60] or "presentation"
+
+    async def _upload_to_owui_files(
+        self, content: bytes, filename: str, mime: str
+    ) -> Optional[dict]:
+        """POST the bytes to OpenWebUI Files API. Returns the JSON payload
+        (with `id`) on success, `None` on any failure (missing token, non-200,
+        transport error). Never raises — the caller decides on fallback."""
+        token = os.getenv("OWUI_ADMIN_TOKEN", "").strip()
+        if not token:
+            if self.valves.debug:
+                print("[mws-auto] owui_upload: OWUI_ADMIN_TOKEN not set")
+            return None
+        url = "http://localhost:8080/api/v1/files/"
+        headers = {"Authorization": f"Bearer {token}"}
+        files = {"file": (filename, content, mime)}
+        try:
+            async with httpx.AsyncClient(timeout=60) as cli:
+                r = await cli.post(url, files=files, headers=headers)
+        except Exception as e:
+            if self.valves.debug:
+                print(f"[mws-auto] owui_upload transport error: {e}")
+            return None
+        if r.status_code != 200:
+            if self.valves.debug:
+                print(f"[mws-auto] owui_upload HTTP {r.status_code}: {r.text[:200]}")
+            return None
+        try:
+            return r.json()
+        except Exception:
+            return None
+
     async def _sa_presentation(self, task: SubTask) -> CompactResult:
+        """Phase 11 subagent: delegate pptx generation to pptx-service and
+        upload the result into OpenWebUI's Files API. Falls back to a
+        markdown slide plan on any error."""
+        # 1. Collect source bytes (first readable attachment on disk)
+        src_bytes: Optional[bytes] = None
+        src_name = ""
+        src_mime = "application/octet-stream"
+        for att in (task.attachments or []):
+            path = att.get("path") or ""
+            if not path or not os.path.exists(path):
+                continue
+            try:
+                with open(path, "rb") as fp:
+                    src_bytes = fp.read()
+                src_name = (
+                    att.get("filename")
+                    or att.get("name")
+                    or os.path.basename(path)
+                    or "source.bin"
+                )
+                src_mime = att.get("content_type") or "application/octet-stream"
+                break
+            except Exception as e:
+                if self.valves.debug:
+                    print(f"[mws-auto] presentation: read attachment failed: {e}")
+
+        if src_bytes is not None and len(src_bytes) > 20 * 1024 * 1024:
+            return await self._presentation_text_fallback(
+                task, reason="attachment > 20 MB; use a smaller source"
+            )
+
+        # 2. Call pptx-service
+        build_url = "http://pptx-service:8000/build"
+        data = {"user_instruction": task.input_text or "Сделай презентацию."}
+        # Follow-up without attachment: pass the conversation context as
+        # source_text so the schema LLM understands what we're refining.
+        conv_ctx = (task.metadata or {}).get("conversation_context") or ""
+        if src_bytes is None and conv_ctx:
+            data["source_text"] = conv_ctx[:8000]
+        files = None
+        if src_bytes is not None:
+            files = {"file": (src_name, src_bytes, src_mime)}
+        try:
+            async with httpx.AsyncClient(timeout=240) as cli:
+                r = await cli.post(build_url, data=data, files=files)
+        except Exception as e:
+            return await self._presentation_text_fallback(
+                task, reason=f"pptx-service unreachable: {e}"
+            )
+        if r.status_code != 200:
+            return await self._presentation_text_fallback(
+                task, reason=f"pptx-service HTTP {r.status_code}: {r.text[:200]}"
+            )
+        pptx_bytes = r.content
+        title = "Presentation"
+        title_b64 = r.headers.get("X-Title-B64") or ""
+        if title_b64:
+            try:
+                title = base64.b64decode(title_b64).decode("utf-8") or title
+            except Exception as e:
+                if self.valves.debug:
+                    print(f"[mws-auto] presentation title decode error: {e}")
+        slide_count = r.headers.get("X-Slide-Count") or "?"
+
+        # 3. Upload to OWUI Files API
+        safe_name = self._slug(title) + ".pptx"
+        uploaded = await self._upload_to_owui_files(
+            pptx_bytes, safe_name, self._PPTX_MIME
+        )
+        if not uploaded or not uploaded.get("id"):
+            return await self._presentation_text_fallback(
+                task,
+                reason="OWUI_ADMIN_TOKEN not set or upload failed",
+                prefix=(
+                    "⚠️ Файл .pptx сгенерирован, но не может быть приложен к чату "
+                    "(не задан OWUI_ADMIN_TOKEN или сбой загрузки). Ниже — план слайдов.\n\n"
+                ),
+            )
+
+        file_id = uploaded["id"]
         return CompactResult(
             kind="presentation",
-            summary=(
-                "⚠️ **Генерация презентаций** будет добавлена в v2.\n\n"
-                "В v2 я смогу сгенерировать Marp/Reveal.js markdown с картинками. "
-                "Пока могу составить структуру презентации в markdown — просто "
-                "попросите план слайдов."
-            ),
+            summary=f"Готова презентация «{title}» — {slide_count} слайдов.",
+            artifacts=[
+                {
+                    "type": "file",
+                    "url": f"/api/v1/files/{file_id}/content",
+                    "filename": safe_name,
+                    "mime": self._PPTX_MIME,
+                }
+            ],
         )
+
+    async def _presentation_text_fallback(
+        self, task: SubTask, reason: str, prefix: str = ""
+    ) -> CompactResult:
+        """Ask the default long-doc model to produce a markdown slide plan so the
+        user still gets useful output when the pptx pipeline fails."""
+        if self.valves.debug:
+            print(f"[mws-auto] presentation fallback: {reason}")
+        lang = (task.metadata or {}).get("lang", "en")
+        sys = (
+            "Ты эксперт по созданию структур презентаций. Составь план на 5–8 слайдов в "
+            "markdown: заголовок слайда (## Slide N — …) и 3–5 буллетов. На русском."
+            if lang == "ru"
+            else "You design presentation outlines. Produce 5–8 slides in markdown: "
+                 "heading `## Slide N — …` plus 3–5 bullets. Keep it concise."
+        )
+        try:
+            result = await self._text_subagent(
+                model="mws/glm-4.6",
+                system=sys,
+                task=task,
+                temperature=0.5,
+            )
+            summary = prefix + (result.summary or "")
+            return CompactResult(
+                kind="presentation",
+                summary=self._truncate_tokens(summary, 700),
+                metadata={"fallback_reason": reason},
+            )
+        except Exception as e:
+            return CompactResult(
+                kind="presentation",
+                summary=prefix + f"(не удалось сгенерировать план: {e})",
+                error=reason,
+            )
