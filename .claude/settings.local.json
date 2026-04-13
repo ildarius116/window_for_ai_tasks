@@ -71,7 +71,8 @@
       "Bash(bash scripts/deploy_function.sh pipelines/auto_router_function.py)",
       "Bash(bash scripts/gen-selfsigned-cert.sh)",
       "Bash(rm -f nginx/ssl/*.pem)",
-      "Bash(openssl req:*)"
+      "Bash(openssl req:*)",
+      "Bash(iconv -f cp1251 -t utf-8)"
     ]
   }
 }
