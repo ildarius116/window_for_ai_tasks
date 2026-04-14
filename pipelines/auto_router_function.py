@@ -439,15 +439,24 @@ class Pipe:
             )
 
         # Skip doc_qa when the user's current message has an explicit
-        # non-document intent (image generation or URL fetch with a URL-
-        # dominant message). Otherwise, a file attached many turns ago
+        # non-document intent (image generation, URL fetch, real-time info,
+        # or memory recall). Otherwise, a file attached many turns ago
         # (which still lives in body["files"]) forces every follow-up
-        # into doc_qa and blocks the real intent.
+        # into doc_qa and blocks the real intent. Weather/news/rates
+        # specifically: "какая погода в москве" after an unrelated PDF
+        # upload used to run doc_qa + web_search in parallel and the
+        # aggregator would emit both "в документах нет инфы о погоде" and
+        # the real weather — the doc_qa half is pure noise.
         _url_dominant = bool(detected.urls) and (
             len(_URL_RE.sub("", detected.last_user_text or "").strip()) <= 60
         )
+        _text = detected.last_user_text or ""
         _skip_doc_qa_for_intent = (
-            detected.wants_image_gen or _url_dominant
+            detected.wants_image_gen
+            or detected.wants_web_search
+            or _url_dominant
+            or self._looks_like_web_search(_text)
+            or self._looks_like_memory_recall(_text, messages)
         )
 
         if detected.has_document and not _skip_doc_qa_for_intent:
