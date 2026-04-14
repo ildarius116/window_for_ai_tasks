@@ -71,7 +71,12 @@ class CompactResult:
 
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 _IMAGE_GEN_RE = re.compile(
-    r"(?i)\b(нарисуй|сгенерируй\s+картинк|draw|generate\s+(an?\s+)?image|make\s+an?\s+image)\b"
+    r"(?iu)("
+    r"нарису\w*|нарисова\w*|рису\w*|"
+    r"изобрази\w*|"
+    r"(сгенерируй|сгенерировать|создай|сделай|построй)\s+(мне\s+)?(картинк\w*|изображени\w*|иллюстраци\w*|рисун\w*|арт|фото)|"
+    r"\bdraw\b|\bpaint\b|generate\s+(an?\s+)?(image|picture|illustration)|make\s+(an?\s+)?(image|picture|illustration)|create\s+(an?\s+)?(image|picture|illustration)"
+    r")"
 )
 _WEB_SEARCH_RE = re.compile(
     r"(?i)\b(найди\s+в\s+интернете|поищи\s+в\s+сети|поищи\s+в\s+интернете|search\s+the\s+web|look\s+up\s+online|актуальн)\b"

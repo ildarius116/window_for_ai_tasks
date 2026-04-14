@@ -279,6 +279,45 @@ def update_host_env(key: str, value: str) -> None:
         log(f"✓ {HOST_ENV_FILE.name}: set {key}")
 
 
+def enable_api_keys_in_config(cur) -> None:
+    """Ensure auth.enable_api_keys=True in the persistent config table.
+
+    OpenWebUI reads ENABLE_API_KEYS env var only on first boot; after that,
+    the value is persisted in `config.data.auth.enable_api_keys` and the env
+    var is ignored. The bootstrap-provisioned admin api_key is worthless
+    unless this flag is true, because /api/v1/files/ rejects api-key bearer
+    auth otherwise (403 "Use of API key is not enabled in the environment").
+    """
+    if not table_exists(cur, "config"):
+        log("⚠ config table missing — cannot enable api keys")
+        return
+    cur.execute("SELECT id, data FROM config ORDER BY id DESC LIMIT 1")
+    row = cur.fetchone()
+    import json as _json
+    if row:
+        config_id, data = row
+        if isinstance(data, str):
+            data = _json.loads(data)
+        data = data or {}
+        auth = data.get("auth") or {}
+        if auth.get("enable_api_keys") is True:
+            log("✓ api_keys already enabled in config")
+            return
+        auth["enable_api_keys"] = True
+        # Keep endpoint restrictions off so file upload works.
+        auth["enable_api_keys_endpoint_restrictions"] = False
+        data["auth"] = auth
+        cur.execute("UPDATE config SET data=%s WHERE id=%s", (Json(data), config_id))
+        log("✓ enabled auth.enable_api_keys in config")
+    else:
+        data = {"version": 0, "auth": {"enable_api_keys": True, "enable_api_keys_endpoint_restrictions": False}}
+        cur.execute(
+            "INSERT INTO config (data, version, created_at) VALUES (%s, 0, now())",
+            (Json(data),),
+        )
+        log("✓ created config row with api_keys enabled")
+
+
 def main() -> int:
     log(
         f"connecting to postgres://{PGUSER}@{PGHOST}:{PGPORT}/{PGDATABASE}"
@@ -288,14 +327,25 @@ def main() -> int:
     with conn.cursor() as cur:
         wait_for_table(cur, "user")
         wait_for_table(cur, "function")
+        enable_api_keys_in_config(cur)
         user_id = wait_for_first_user(cur)
         log(f"✓ first user detected: id={user_id}")
 
-        # Mirror compose-resolved Langfuse keys into .env so the file stays
-        # the single source of truth. These are provisioned into langfuse
-        # headlessly via LANGFUSE_INIT_* in compose; here we just publish
-        # the same values to the host .env for operator visibility.
-        for env_key in ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY"):
+        # Mirror compose-resolved secrets into .env so the file stays the
+        # single source of truth. Values come from compose defaults on first
+        # boot or from the operator's existing .env on subsequent boots —
+        # either way bootstrap writes them through. update_host_env() never
+        # clobbers operator-provided values (only empty lines are filled).
+        mirrored_keys = (
+            "LANGFUSE_PUBLIC_KEY",
+            "LANGFUSE_SECRET_KEY",
+            "LITELLM_MASTER_KEY",
+            "OPENWEBUI_SECRET_KEY",
+            "POSTGRES_PASSWORD",
+            "LANGFUSE_NEXTAUTH_SECRET",
+            "LANGFUSE_SALT",
+        )
+        for env_key in mirrored_keys:
             val = os.environ.get(env_key, "").strip()
             if val:
                 try:

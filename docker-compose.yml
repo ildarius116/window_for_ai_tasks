@@ -88,6 +88,15 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-mws}:${POSTGRES_PASSWORD:-mws_dev_postgres_pw_change_in_prod}@postgres:5432/${POSTGRES_DB:-openwebui}
       ENABLE_SIGNUP: "true"
       ENABLE_LOGIN_FORM: "true"
+      # Required for the bootstrap-provisioned admin api_key (sk-…) to work
+      # against /api/v1/files/ (used by _sa_presentation for pptx upload).
+      # Without this, API-key bearer auth is rejected and pptx falls back to
+      # a markdown plan even though the file was successfully rendered.
+      # NOTE: env var name is ENABLE_API_KEYS (plural) in OpenWebUI; it's a
+      # PersistentConfig, so bootstrap also UPSERTs auth.enable_api_keys=true
+      # into the config table on every boot.
+      ENABLE_API_KEYS: "true"
+      ENABLE_API_KEY_ENDPOINT_RESTRICTIONS: "false"
       WEBUI_AUTH: "true"
       DEFAULT_MODELS: "mws/gpt-alpha"
       ENABLE_OLLAMA_API: "false"
@@ -318,6 +327,11 @@ services:
       # writes them through.
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-mws-dev-public-key-change-in-prod}
       LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-mws-dev-secret-key-change-in-prod}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-mws-dev-litellm-master-key-change-in-prod}
+      OPENWEBUI_SECRET_KEY: ${OPENWEBUI_SECRET_KEY:-mws-dev-openwebui-secret-key-change-in-prod}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mws_dev_postgres_pw_change_in_prod}
+      LANGFUSE_NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:-mws-dev-langfuse-nextauth-secret-change-in-prod}
+      LANGFUSE_SALT: ${LANGFUSE_SALT:-mws-dev-langfuse-salt-change-in-prod}
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       PIP_NO_CACHE_DIR: "1"
     volumes:
