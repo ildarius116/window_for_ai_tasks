@@ -44,6 +44,7 @@ class EpisodeRecall(BaseModel):
     date_from: datetime | None = None
     date_to: datetime | None = None
     limit: int = 5
+    exclude_chat_id: str | None = None
 
 
 class EpisodeRecallResult(BaseModel):
@@ -115,6 +116,7 @@ async def recall_episodes(
         WHERE user_id = :user_id
           AND (CAST(:date_from AS timestamptz) IS NULL OR turn_end_at >= CAST(:date_from AS timestamptz))
           AND (CAST(:date_to   AS timestamptz) IS NULL OR turn_end_at <= CAST(:date_to   AS timestamptz))
+          AND (CAST(:exclude_chat_id AS text) IS NULL OR chat_id <> CAST(:exclude_chat_id AS text))
         ORDER BY embedding <=> CAST(:qvec AS vector)
         LIMIT :limit
         """
@@ -126,6 +128,7 @@ async def recall_episodes(
             "user_id": body.user_id,
             "date_from": body.date_from,
             "date_to": body.date_to,
+            "exclude_chat_id": body.exclude_chat_id,
             "limit": limit,
         },
     )
