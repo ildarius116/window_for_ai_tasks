@@ -64,23 +64,29 @@ class Filter:
         into the message text, the auto-router pipe can detect uploads
         and route to the correct subagent (STT for audio, doc_qa for docs).
 
-        Prefer `metadata.parent_message.files` (attachments bound to the
-        current turn in OpenWebUI's real UI shape). Fall back to
-        `body["files"]` because when a user attaches a file via the live UI
-        and hits Send, OpenWebUI does NOT always populate parent_message.files
-        in the chat-completions body — the attachments live only in the
-        top-level accumulator. Without the fallback, `has_document` stays
-        False on the very turn of upload and `doc_qa` never fires.
-        The "stuck context" problem (URL / image_gen blocked by a stale
-        attachment in body["files"]) is handled one layer up, in
-        `_classify_and_plan`, which now skips doc_qa when the current user
-        text has an explicit image_gen or URL intent.
+        Prefer `metadata.parent_message.files` — when that key is present in
+        the body, OpenWebUI has already done per-turn binding and an empty
+        list literally means "no attachments on this turn". Only fall back to
+        the top-level `body["files"]` accumulator when `parent_message` is
+        entirely absent AND this is the very first user turn (no prior user
+        messages). Rationale: `body["files"]` is a chat-level accumulator that
+        retains every upload since the beginning of the conversation, so using
+        it on follow-up turns causes "stuck context" bugs — e.g. a stale mp3
+        from turn 1 makes every subsequent plain-text question route into
+        sa_stt/doc_qa. Gating the fallback to first-turn uploads preserves the
+        legitimate first-upload case while killing cross-turn contamination.
         """
         metadata = body.get("metadata") or {}
-        parent_msg = metadata.get("parent_message") or {}
-        files = parent_msg.get("files") or []
-        if not files:
-            files = body.get("files") or []
+        if "parent_message" in metadata:
+            parent_msg = metadata.get("parent_message") or {}
+            files = parent_msg.get("files") or []
+        else:
+            # Only trust the top-level accumulator on the first user turn.
+            messages = body.get("messages", [])
+            prior_user_turns = sum(
+                1 for m in messages if m.get("role") == "user"
+            )
+            files = body.get("files") or [] if prior_user_turns <= 1 else []
 
         audio_files = []
         doc_files = []

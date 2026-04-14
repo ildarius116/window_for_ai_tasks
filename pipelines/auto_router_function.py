@@ -157,20 +157,28 @@ class Pipe:
         body: dict,
         __user__: Optional[dict] = None,
         __request__=None,
+        __metadata__: Optional[dict] = None,
     ) -> AsyncGenerator[str, None]:
         messages = body.get("messages", []) or []
         files = body.get("files", []) or []
         trace_id = str(uuid.uuid4())
         user_id = (__user__ or {}).get("id")
+        chat_id = (
+            (__metadata__ or {}).get("chat_id")
+            or body.get("chat_id")
+            or ""
+        )
 
         detected = self._detect(messages, files)
         if self.valves.debug:
             print(
                 f"[mws-auto {trace_id[:8]}] detected={detected.to_dict()} "
-                f"user_id={user_id}"
+                f"user_id={user_id} chat_id={chat_id}"
             )
 
-        plan = await self._classify_and_plan(detected, messages, user_id=user_id)
+        plan = await self._classify_and_plan(
+            detected, messages, user_id=user_id, chat_id=chat_id
+        )
         if self.valves.debug:
             print(
                 f"[mws-auto {trace_id[:8]}] plan={[(t.kind, t.model) for t in plan]}"
@@ -328,6 +336,16 @@ class Pipe:
             if tail:
                 last_user_text = tail
 
+        # Normalize markdown decoration that OpenWebUI sometimes wraps around
+        # user input after a RAG / web_search turn (observed: `*   _Докажи, что
+        # …_`). Two issues this fixes:
+        #   1. `_italic_` wrapping — `_` is a \w character in Python regex, so
+        #      `\b` anchors in _REASONER_RE etc. don't fire against it.
+        #   2. Leading bullet markers `*   ` / `- ` / `• ` that leak from the
+        #      surrounding list context even without a `<context>` tag.
+        last_user_text = re.sub(r"^[\s\*\-\u2022]+", "", last_user_text)
+        last_user_text = last_user_text.strip().strip("_*`").strip()
+
         det.last_user_text = last_user_text or ""
 
         # URLs
@@ -356,6 +374,7 @@ class Pipe:
         detected: DetectedInput,
         messages: list,
         user_id: Optional[str] = None,
+        chat_id: Optional[str] = None,
     ) -> list[SubTask]:
         plan: list[SubTask] = []
 
@@ -607,6 +626,15 @@ class Pipe:
             kind = "web_search"
             model = "mws/kimi-k2"
 
+        # Same pattern for code: gpt-oss-20b tends to return general/ru_chat for
+        # Russian code requests ("напиши на Python класс …"), and the lang-aware
+        # override then pins it to sa_ru_chat/qwen3-235b instead of sa_code.
+        if kind not in ("code", "reasoner", "memory_recall", "web_search") and self._looks_like_code(
+            detected.last_user_text
+        ):
+            kind = "code"
+            model = "mws/qwen3-coder"
+
         # If routed to memory_recall but no time_window from classifier,
         # try to extract one from the user text.
         if kind == "memory_recall" and not time_window:
@@ -615,6 +643,10 @@ class Pipe:
         meta: dict = {"lang": detected.lang, "user_id": user_id}
         if time_window:
             meta["time_window"] = time_window
+        if kind == "memory_recall" and chat_id:
+            # Exclude current chat from recall — "в прошлом чате" / "in the
+            # previous chat" implies other chats, not the one we're in now.
+            meta["exclude_chat_id"] = chat_id
         plan.append(
             SubTask(
                 kind=kind,
@@ -792,6 +824,67 @@ class Pipe:
         "сегодня", "сейчас", "актуальн", "текущ", "нынешн",
         "today", "now", "current", "latest", "right now", "at the moment",
     )
+
+    # Code safety-net markers. Same word-group pattern as _looks_like_web_search:
+    # either a "strong" marker fires alone, or (lang marker + action marker) combo.
+    # Runs AFTER _llm_classify as a safety net — gpt-oss-20b frequently returns
+    # general/ru_chat for Russian code requests ("напиши на Python класс …"),
+    # and the lang-aware override then pins the plan to sa_ru_chat/qwen3-235b
+    # instead of sa_code/qwen3-coder.
+    _CODE_STRONG_MARKERS = (
+        "напиши код", "напиши функц", "напиши класс", "напиши метод",
+        "напиши скрипт", "напиши программ", "напиши тест",
+        "реализуй функц", "реализуй класс", "реализуй метод",
+        "реализуй алгоритм", "реализуй структур",
+        "unit-тест", "unit тест", "юнит-тест", "юнит тест",
+        "докстринг", "докстрок", "отрефактор", "отлад",
+        "pytest", "unittest", "jest", "vitest", "junit",
+        "docstring", "type hints", "type annotations",
+        "unit test", "unit-test", "write code", "write a function",
+        "write a class", "write a method", "write a program",
+        "write a script", "write tests", "write unit test",
+        "implement a function", "implement a class", "implement a method",
+        "implement an algorithm", "implement a data structure",
+        "refactor this", "refactor the", "fix the bug", "debug this",
+    )
+    _CODE_LANG_MARKERS = (
+        "python", "javascript", " js ", "typescript", " ts ",
+        "node.js", "nodejs", "rust", "golang", " go ", "java ",
+        "kotlin", "swift", "c++", "cpp", "c#", "csharp",
+        "ruby", " php ", "sql", "bash", "shell", "powershell",
+        "haskell", "scala", "elixir", "dart", "flutter",
+        "react", "vue", "angular", "svelte", "django", "fastapi",
+        "flask", "express", "spring", "laravel", "rails",
+        "pandas", "numpy", "pytorch", "tensorflow",
+    )
+    _CODE_ACTION_MARKERS = (
+        "функци", "класс", "метод", "алгоритм", "декоратор", "интерфейс",
+        "скрипт", "программ", "модул", "библиотек", "компонент",
+        "структур данных", "сложност", "асимптотик",
+        "function", "class", "method", "algorithm", "decorator",
+        "interface", "module", "library", "component", "data structure",
+        "complexity", "big-o", "big o",
+    )
+
+    @classmethod
+    def _looks_like_code(cls, text: str) -> bool:
+        """Semantic check: does the text ask for code to be written/fixed/refactored?
+
+        Word-group intersection safety net (NOT a primary gate — runs AFTER the
+        LLM classifier). Fires when the text contains either a strong standalone
+        marker ("напиши код", "pytest", "docstring", "write a function", …) OR a
+        (language + action) combo like "Python" + "класс" / "Rust" + "function".
+        A bare "что такое Python" has the lang marker but no action marker and
+        falls through to the LLM classifier unchanged.
+        """
+        t = (text or "").lower()
+        if not t:
+            return False
+        if any(m in t for m in cls._CODE_STRONG_MARKERS):
+            return True
+        has_lang = any(m in t for m in cls._CODE_LANG_MARKERS)
+        has_action = any(m in t for m in cls._CODE_ACTION_MARKERS)
+        return has_lang and has_action
 
     @classmethod
     def _looks_like_web_search(cls, text: str) -> bool:
@@ -1176,6 +1269,11 @@ class Pipe:
             if detected.lang == "ru"
             else "Answer in English using markdown."
         )
+        # Inject current date so the aggregator can answer time-aware questions
+        # ("какой сегодня день", "what's today's date", "сколько до нового года")
+        # without relying on the LLM's stale training cutoff.
+        today_iso = datetime.now(timezone.utc).date().isoformat()
+        date_line = f"Current date: {today_iso}\n"
         # Extract memory context injected by the mws_memory inlet filter.
         # It arrives as one or more role=system messages; without this we
         # would silently drop them when building final_messages below.
@@ -1187,6 +1285,7 @@ class Pipe:
             if memory_ctx else ""
         )
         system_prompt = (
+            f"{date_line}"
             'Ты — финальный агент "MWS GPT Auto". Ниже — результаты работы вспомогательных '
             "субагентов. Используй их как факты. Не показывай пользователю внутреннюю "
             "кухню и не дублируй служебные теги вроде [sa_*]. "
@@ -1212,6 +1311,12 @@ class Pipe:
             "перевести предыдущий ответ — используй историю диалога, а НЕ результаты "
             "субагентов. Результаты субагентов полезны только для нового контента "
             "(поиск, fetch, генерация). "
+            "ОТДЕЛЬНО про [sa_memory_recall]: если этот субагент вернул список эпизодов, "
+            "сгруппированных по чатам (секции вида '### Чат «...» [даты]'), "
+            "сохрани эту структуру В ТОЧНОСТИ: каждый чат — отдельный раздел с заголовком "
+            "и датой, не сливай эпизоды разных чатов в один абзац, не переписывай даты, "
+            "не обобщай в единое резюме. Можно слегка перефразировать отдельные пункты, "
+            "но границы чатов и даты должны быть видны пользователю. "
             f"{lang_instr}"
             f"{memory_block}"
             f"\n\n--- SUBAGENT RESULTS ---\n{scratchpad}"
@@ -1384,17 +1489,25 @@ class Pipe:
         return CompactResult(kind=task.kind, summary=self._truncate_tokens(text, 500))
 
     async def _sa_general(self, task: SubTask) -> CompactResult:
+        today_iso = datetime.now(timezone.utc).date().isoformat()
         return await self._text_subagent(
             model=task.model or "mws/gpt-alpha",
-            system="You are a helpful, concise assistant. Answer in English in markdown.",
+            system=(
+                f"Current date: {today_iso}\n"
+                "You are a helpful, concise assistant. Answer in English in markdown."
+            ),
             task=task,
             temperature=0.7,
         )
 
     async def _sa_ru_chat(self, task: SubTask) -> CompactResult:
+        today_iso = datetime.now(timezone.utc).date().isoformat()
         return await self._text_subagent(
             model=task.model or "mws/qwen3-235b",
-            system="Ты — дружелюбный и лаконичный ассистент. Отвечай на русском в markdown.",
+            system=(
+                f"Current date: {today_iso}\n"
+                "Ты — дружелюбный и лаконичный ассистент. Отвечай на русском в markdown."
+            ),
             task=task,
             temperature=0.7,
         )
@@ -1892,11 +2005,17 @@ class Pipe:
                 summary="",
                 error="memory_recall: no user_id in metadata",
             )
+        exclude_chat_id = task.metadata.get("exclude_chat_id")
+        # Fetch more episodes than we'll show so that after grouping by chat
+        # we still have something meaningful (5 top episodes may all come from
+        # the same chat).
         payload: dict = {
             "user_id": user_id,
             "query": task.input_text,
-            "limit": 5,
+            "limit": 10,
         }
+        if exclude_chat_id:
+            payload["exclude_chat_id"] = exclude_chat_id
         tw = task.metadata.get("time_window") or {}
         if tw.get("from"):
             payload["date_from"] = tw["from"]
@@ -1921,16 +2040,80 @@ class Pipe:
                 kind="memory_recall",
                 summary="В истории диалогов ничего не найдено по этому запросу.",
             )
-        lines: list[str] = []
+
+        # Group episodes by chat_id so the aggregator sees per-chat sections
+        # instead of a flat list it's tempted to melt into one paragraph.
+        groups: dict[str, list[dict]] = {}
+        order: list[str] = []
         for ep in episodes:
-            date = (ep.get("turn_end_at") or "")[:10]
-            lines.append(f"- [{date}] {(ep.get('summary') or '').strip()}")
-        body = "Найденные эпизоды из прошлых диалогов:\n" + "\n".join(lines)
+            cid = ep.get("chat_id") or "unknown"
+            if cid not in groups:
+                groups[cid] = []
+                order.append(cid)
+            groups[cid].append(ep)
+
+        # Resolve chat titles from openwebui's postgres (best effort, short
+        # timeout). Without this the aggregator only sees opaque uuids.
+        titles = await self._fetch_chat_titles(order)
+
+        sections: list[str] = []
+        for cid in order:
+            eps = groups[cid]
+            # Date range of this chat's episodes.
+            dates = sorted(
+                (ep.get("turn_end_at") or "")[:10] for ep in eps if ep.get("turn_end_at")
+            )
+            date_label = (
+                f"{dates[0]} … {dates[-1]}" if dates and dates[0] != dates[-1]
+                else (dates[0] if dates else "")
+            )
+            title = titles.get(cid) or "(без названия)"
+            header = f"### Чат «{title}» [{date_label}] (id={cid[:8]})"
+            bullets = [
+                f"- [{(ep.get('turn_end_at') or '')[:10]}] {(ep.get('summary') or '').strip()}"
+                for ep in eps
+            ]
+            sections.append(header + "\n" + "\n".join(bullets))
+
+        body = (
+            "Найденные эпизоды из прошлых диалогов (сгруппировано по чатам):\n\n"
+            + "\n\n".join(sections)
+        )
         return CompactResult(
             kind="memory_recall",
-            summary=self._truncate_tokens(body, 500),
-            citations=[ep.get("chat_id") for ep in episodes if ep.get("chat_id")],
+            summary=self._truncate_tokens(body, 700),
+            citations=[cid for cid in order if cid and cid != "unknown"],
         )
+
+    async def _fetch_chat_titles(self, chat_ids: list[str]) -> dict[str, str]:
+        """Best-effort lookup of chat titles from openwebui's postgres.
+
+        Uses the OWUI admin API so we don't hardcode DB credentials into the
+        pipe. Returns {} on any failure — memory_recall still works without
+        titles, it just shows chat uuids.
+        """
+        token = os.getenv("OWUI_ADMIN_TOKEN", "")
+        if not token or not chat_ids:
+            return {}
+        titles: dict[str, str] = {}
+        try:
+            async with httpx.AsyncClient(timeout=5) as cli:
+                # OpenWebUI has no bulk endpoint; fetch per-id. Cap at 10.
+                for cid in chat_ids[:10]:
+                    try:
+                        r = await cli.get(
+                            f"http://localhost:8080/api/v1/chats/{cid}",
+                            headers={"Authorization": f"Bearer {token}"},
+                        )
+                        if r.status_code == 200:
+                            data = r.json() or {}
+                            titles[cid] = (data.get("title") or "").strip()
+                    except Exception:
+                        continue
+        except Exception as e:
+            if self.valves.debug:
+                print(f"[mws-auto] chat title lookup failed: {e}")
+        return titles
 
     # ------------------------------------------------------------------
     # Stubs (v2)
