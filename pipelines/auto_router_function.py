@@ -40,6 +40,7 @@ class DetectedInput:
     document_attachments: list[dict] = field(default_factory=list)
     wants_image_gen: bool = False
     wants_web_search: bool = False
+    wants_deep_research: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -80,6 +81,28 @@ _IMAGE_GEN_RE = re.compile(
 )
 _WEB_SEARCH_RE = re.compile(
     r"(?i)\b(найди\s+в\s+интернете|поищи\s+в\s+сети|поищи\s+в\s+интернете|search\s+the\s+web|look\s+up\s+online|актуальн)\b"
+)
+# Matches any 4-digit year 2000-2099. Used by _looks_like_web_search together
+# with an info-seeking verb: if the user asks about a year >= current, the
+# model's training data is almost certainly stale/partial and we must hit DDG.
+_YEAR_RE = re.compile(r"\b(20\d{2})\b")
+# Deep research: multi-step investigation requiring multiple parallel searches
+# plus synthesis. Separate from web_search because the classifier needs to
+# know whether to dispatch _sa_deep_research (heavier, 3-5 DDG queries + fetch
+# + synthesis via kimi-k2) instead of a single-shot _sa_web_search.
+_DEEP_RESEARCH_RE = re.compile(
+    r"(?iu)("
+    r"проведи\s+(глубок\w*|подробн\w*|детальн\w*|тщательн\w*|полн\w*)?\s*исследовани\w*|"
+    r"исследуй\s+тему|исследуй\s+вопрос|"
+    r"(глубок\w*|подробн\w*|детальн\w*)\s+исследовани\w*|"
+    r"углуб\w*\s+(в\s+тему|анализ)|"
+    r"всесторонн\w*\s+анализ|"
+    r"составь\s+(аналитическ\w*\s+)?отчёт|"
+    r"deep\s+research|"
+    r"in[-\s]?depth\s+(research|analysis|investigation)|"
+    r"thorough\s+(research|analysis|investigation)|"
+    r"research\s+(the\s+)?(topic|question|subject)"
+    r")"
 )
 _DOC_EXT_RE = re.compile(r"\.(pdf|docx?|txt|md|rtf)$", re.IGNORECASE)
 _CYRILLIC_RE = re.compile(r"[а-яА-ЯёЁ]")
@@ -362,6 +385,7 @@ class Pipe:
         if det.last_user_text:
             det.wants_image_gen = bool(_IMAGE_GEN_RE.search(det.last_user_text))
             det.wants_web_search = bool(_WEB_SEARCH_RE.search(det.last_user_text))
+            det.wants_deep_research = bool(_DEEP_RESEARCH_RE.search(det.last_user_text))
 
         return det
 
@@ -473,6 +497,7 @@ class Pipe:
         _skip_doc_qa_for_intent = (
             detected.wants_image_gen
             or detected.wants_web_search
+            or detected.wants_deep_research
             or _url_dominant
             or self._looks_like_web_search(_text)
             or self._looks_like_memory_recall(_text, messages)
@@ -539,7 +564,21 @@ class Pipe:
                 )
             )
 
-        if detected.wants_web_search:
+        # Deep research fires on its own signal ("проведи исследование",
+        # "deep research", ...) OR when the user asks web_search AND explicitly
+        # wants "подробно"/"детально"/"thoroughly". When both web_search and
+        # deep_research trigger, prefer deep_research (it subsumes web_search —
+        # runs 3-5 parallel DDG queries + synthesis instead of one).
+        if detected.wants_deep_research:
+            plan.append(
+                SubTask(
+                    kind="deep_research",
+                    input_text=detected.last_user_text,
+                    model="mws/kimi-k2",
+                    metadata={"lang": detected.lang, "user_id": user_id},
+                )
+            )
+        elif detected.wants_web_search:
             plan.append(
                 SubTask(
                     kind="web_search",
@@ -807,6 +846,22 @@ class Pipe:
         "погод", "weather", "прогноз погод",
         "новост", "news", "latest news", "последние",
         "что нового", "what's new", "whats new",
+        # Competition / event outcomes: inherently public-record facts the
+        # classifier can't reliably know. "кто выиграл ...", "кто победил ...",
+        # "кто стал чемпионом ..." — all real-time lookups.
+        "кто выиграл", "кто победил", "кто стал", "кто получил",
+        "кто занял", "кто выиграет", "кто победит",
+        "who won", "who became", "who is the winner",
+    )
+    # Information-seeking verbs used by the year-based heuristic below.
+    _WEB_SEEK_MARKERS = (
+        "найди ", "найти ", "поищи ", "ищу ", "ищи ",
+        "расскажи про", "расскажи о", "расскажи об",
+        "узнай ", "узнать ",
+        "что случилось", "что произошло", "что известно",
+        "информаци",
+        "find ", "search ", "look up", "tell me about",
+        "what happened", "what is known",
     )
     # TOPIC markers: volatile facts that MIGHT be historical (prices can be
     # queried for a past date). Need a real-time marker to fire.
@@ -904,7 +959,19 @@ class Pipe:
             return True
         has_topic = any(m in t for m in cls._WEB_TOPIC_MARKERS)
         has_now = any(m in t for m in cls._WEB_NOW_MARKERS)
-        return has_topic and has_now
+        if has_topic and has_now:
+            return True
+        # Year heuristic: info-seeking verb ("найди", "расскажи про", "who won")
+        # AND a 4-digit year — user explicitly anchors a question to a specific
+        # year's event. Training-data cutoff is rarely a clean boundary: even
+        # "мисс мира 2025" (last-year event, finaled in Dec) is past the cutoff
+        # for many models. Safer to DDG on any explicit year + info-seek, and
+        # let the synthesis LLM note "insufficient info" if the search is weak.
+        # Catches "найди информацию о мисс мира 2025", "расскажи про выборы 2024",
+        # "who won the championship 2023".
+        if _YEAR_RE.search(t) and any(m in t for m in cls._WEB_SEEK_MARKERS):
+            return True
+        return False
 
     async def _llm_classify(
         self, detected: DetectedInput, messages: list | None = None
@@ -2120,15 +2187,160 @@ class Pipe:
     # ------------------------------------------------------------------
 
     async def _sa_deep_research(self, task: SubTask) -> CompactResult:
+        """Multi-query research: split the question into sub-queries, DDG each
+        in parallel, fetch top pages, synthesize a structured answer with
+        citations. Heavier than _sa_web_search (single query) — use when the
+        user explicitly asks for research/investigation, or the classifier
+        picks intent="deep_research".
+        """
+        query = task.input_text
+        if not query:
+            return CompactResult(kind="deep_research", error="empty query")
+
+        lang = task.metadata.get("lang", "ru")
+        today = datetime.now(timezone.utc).date().isoformat()
+
+        # Step 1 — split the question into 3-5 focused sub-queries.
+        # gpt-oss-20b is cheap and fast; temperature low so the splits are
+        # deterministic and topical rather than creative.
+        split_system = (
+            f"Today is {today}. You are a research planner. Split the user's "
+            "question into 3-5 focused web search queries that together fully "
+            "cover the topic. Each query must be a standalone search-engine "
+            "string (not a full sentence), on its own line, no numbering, no "
+            "bullets, no commentary. If the topic mentions a specific year, "
+            "include that year in every query. Prefer short queries (5-10 words)."
+        )
+        sub_queries: list[str] = []
+        try:
+            split_resp = await self._call_litellm(
+                model="mws/gpt-oss-20b",
+                messages=[
+                    {"role": "system", "content": split_system},
+                    {"role": "user", "content": query},
+                ],
+                temperature=0.2,
+                max_tokens=250,
+            )
+            split_text = (
+                split_resp.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content")
+                or ""
+            )
+            for line in split_text.splitlines():
+                q = line.strip(" \t-•*0123456789.)").strip()
+                if q and len(q) >= 3:
+                    sub_queries.append(q)
+            sub_queries = sub_queries[:5]
+        except Exception as e:
+            if self.valves.debug:
+                print(f"[mws-auto] sa_deep_research split failed: {e}")
+
+        # Fallback: if split failed, use the original query alone.
+        if not sub_queries:
+            sub_queries = [query]
+
+        # Step 2 — run DDG in parallel across all sub-queries.
+        async def _safe_search(q: str) -> list[dict]:
+            try:
+                return await self._ddg_search(q, n=3)
+            except Exception:
+                return []
+
+        search_results = await asyncio.gather(
+            *[_safe_search(q) for q in sub_queries]
+        )
+
+        # Dedupe by URL, preserve order (first-seen wins).
+        seen: set[str] = set()
+        all_hits: list[dict] = []
+        for hits in search_results:
+            for h in hits:
+                u = h.get("url", "")
+                if u and u not in seen:
+                    seen.add(u)
+                    all_hits.append(h)
+        # Cap total sources: 8 is enough for synthesis, keeps latency sane.
+        all_hits = all_hits[:8]
+
+        if not all_hits:
+            return CompactResult(
+                kind="deep_research",
+                error="no search results for any sub-query",
+            )
+
+        # Step 3 — fetch page bodies in parallel (best-effort; snippet fallback).
+        async def _safe_fetch(u: str) -> str:
+            try:
+                return (await self._fetch_url_text(u))[:2500]
+            except Exception:
+                return ""
+
+        bodies = await asyncio.gather(
+            *[_safe_fetch(h["url"]) for h in all_hits]
+        )
+        context_block = "\n\n".join(
+            f"[{i+1}] {h['title']} — {h['url']}\n{body or h.get('snippet','')}"
+            for i, (h, body) in enumerate(zip(all_hits, bodies))
+        )
+        sub_queries_block = "\n".join(f"- {q}" for q in sub_queries)
+
+        # Step 4 — synthesize a structured answer with citations.
+        lang_hint = (
+            "Отвечай на русском языке." if lang == "ru"
+            else "Answer in English."
+        )
+        synth_system = (
+            f"Today is {today}. Ты — исследовательский агент. Тебе даны "
+            "исходный вопрос, сгенерированные подзапросы и фрагменты из "
+            "нескольких источников. Сделай структурированный ответ:\n"
+            "1) Краткое резюме (2-3 предложения) с ключевым выводом.\n"
+            "2) Основные факты с цитированием источников в формате [1], [2] "
+            "и т.д. — цитируй только те номера, что реально приведены ниже.\n"
+            "3) Если источники противоречат друг другу — укажи это явно.\n"
+            "4) Если информации недостаточно для уверенного ответа — скажи "
+            "об этом прямо, не выдумывай факты.\n"
+            "Не придумывай URL'ы и не добавляй несуществующие источники. "
+            + lang_hint
+        )
+        try:
+            resp = await self._call_litellm(
+                model=task.model or "mws/kimi-k2",
+                messages=[
+                    {"role": "system", "content": synth_system},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Исходный вопрос: {query}\n\n"
+                            f"Подзапросы ({len(sub_queries)}):\n{sub_queries_block}\n\n"
+                            f"Источники ({len(all_hits)}):\n{context_block}"
+                        ),
+                    },
+                ],
+                temperature=0.35,
+                max_tokens=900,
+            )
+        except Exception as e:
+            return CompactResult(
+                kind="deep_research",
+                error=f"synthesis failed: {e}",
+                citations=[h["url"] for h in all_hits],
+            )
+        text = (
+            resp.get("choices", [{}])[0].get("message", {}).get("content") or ""
+        ).strip()
+        if not text:
+            return CompactResult(
+                kind="deep_research",
+                error="empty synthesis",
+                citations=[h["url"] for h in all_hits],
+            )
         return CompactResult(
             kind="deep_research",
-            summary=(
-                "⚠️ **Deep Research** будет добавлен в v2.\n\n"
-                "В следующей версии я смогу провести многошаговое исследование: "
-                "собрать факты из нескольких источников, проверить их и сделать вывод. "
-                "Пока могу ответить на основе одного поискового запроса — попросите "
-                '"поищи в интернете ...".'
-            ),
+            summary=self._truncate_tokens(text, 700),
+            citations=[h["url"] for h in all_hits],
+            metadata={"sub_queries": sub_queries, "sources": len(all_hits)},
         )
 
     # ------------------------------------------------------------------
