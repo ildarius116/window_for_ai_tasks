@@ -180,9 +180,9 @@ GET    /health                — healthcheck
 
 ## Agent System
 
-Development is organized through 15 specialized subagents defined in `.claude/agents.json` and described in `project_assignment.md`. The team lead (Opus) coordinates and delegates ALL implementation work to worker subagents (Sonnet). The main context is strictly for coordination, planning, and user communication — never for direct implementation.
+Development is organized through 16 specialized subagents defined in `.claude/agents.json` and described in `project_assignment.md`. The team lead (Opus) coordinates and delegates ALL implementation work to worker subagents (Sonnet). The main context is strictly for coordination, planning, and user communication — never for direct implementation.
 
-Key agents: ArchitectAgent, DevOpsAgent, SecurityAgent, BackendCoderAgent, AIRouterAgent, MemoryAgent, VoiceAgent, FileAgent, FrontendAgent/OpenWebUIAgent, ReviewerAgent, TesterAgent, DocsAgent, SkillCreatorAgent. Each has mapped MCP skills in `.claude/skills/`.
+Key agents: ArchitectAgent, DevOpsAgent, SecurityAgent, BackendCoderAgent, AIRouterAgent, MemoryAgent, VoiceAgent, FileAgent, FrontendAgent/OpenWebUIAgent, ReviewerAgent, TesterAgent, DocsAgent, SkillCreatorAgent, **FactCheckerAgent** (проверяет источники и ссылки других агентов на реальность, защищает от галлюцинаций). Each has mapped MCP skills in `.claude/skills/`.
 
 ## Project Status
 

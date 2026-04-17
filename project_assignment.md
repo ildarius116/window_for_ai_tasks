@@ -83,6 +83,9 @@
 
 🛠️  SkillCreatorAgent     Создание новых скиллов для субагентов,       skill-development
                           обновление промптов, онбординг                agent-development
+
+🕵️  FactCheckerAgent      Проверка источников и ссылок других          context7-documentation-lookup
+                          агентов на реальность, защита от галлюцинаций security-owasp
 ```
 
 ---
