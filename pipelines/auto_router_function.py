@@ -66,6 +66,39 @@ class CompactResult:
     metadata: dict = field(default_factory=dict)
 
 
+# Phase 12 — FactChecker dataclasses.
+# These are produced by _sa_fact_check (added in phase-12-6) and carried in
+# CompactResult.metadata["report"] so the aggregator can cite verdicts without
+# breaking the context-isolation invariant (only summaries cross boundaries).
+
+
+@dataclass
+class UrlStatus:
+    url: str
+    status: str  # url_ok | url_redirect | url_404 | url_unreachable | url_auth_required | url_blocked_ssrf
+    http_code: Optional[int] = None
+    final_url: Optional[str] = None
+    snippet: str = ""  # first ~2KB of text when url_ok, fed to the verdict LLM
+    error: str = ""
+
+
+@dataclass
+class Claim:
+    text: str
+    source_kind: str  # kind of the subagent whose summary produced this claim
+    verdict: str = "unknown"  # grounded | partial | ungrounded | unknown
+    evidence_url: Optional[str] = None
+    reason: str = ""
+
+
+@dataclass
+class FactCheckReport:
+    urls: list[UrlStatus] = field(default_factory=list)
+    claims: list[Claim] = field(default_factory=list)
+    total_checked_kinds: list[str] = field(default_factory=list)
+    error: Optional[str] = None
+
+
 # ---------------------------------------------------------------------------
 # Regex helpers
 # ---------------------------------------------------------------------------
@@ -127,6 +160,100 @@ def _looks_like_presentation(text: str) -> bool:
     return any(m in t for m in _PPTX_MARKERS)
 
 
+# Phase 12 — FactChecker constants.
+# _CHECKABLE_KINDS: if the plan contains any of these subagent kinds, the
+# phase-1.5 fact-check runs automatically. The other kinds (general, ru_chat,
+# code, reasoner, long_doc, vision, stt, image_gen, presentation) either make
+# no verifiable real-world claims or the cost of verification doesn't pay off.
+_CHECKABLE_KINDS = {
+    "web_search",
+    "web_fetch",
+    "deep_research",
+    "memory_recall",
+    "doc_qa",
+}
+
+# Explicit user trigger: "проверь факты / fact-check / verify the sources" etc.
+# Forces fact-check even when the plan doesn't include a _CHECKABLE_KINDS item.
+_FACT_CHECK_TRIGGER_RE = re.compile(
+    r"(?i)(провер\w*\s+(факты|источник\w*)|fact[-\s]?check|verify\s+(the\s+)?(claims|sources|facts))"
+)
+
+# SSRF guard: any URL that resolves (or claims to resolve) to localhost or
+# RFC1918 private ranges is dropped before _validate_urls touches it. This
+# blocks hallucinated or malicious URLs from probing internal services.
+_SSRF_BLOCK_RE = re.compile(
+    r"^(https?://)?(localhost|127\.|10\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[0-1])\.)"
+)
+
+
+# Phase 12-4 — prompt for the cheap LLM that extracts verifiable claims from
+# the summaries of other subagents (fact_check_claim_model, default
+# mws/gpt-oss-20b). Must stay in sync with `_extract_claims` below.
+_CLAIM_EXTRACT_PROMPT = """Ты — выделитель проверяемых фактов.
+На вход — сводки ответов от других AI-субагентов. Выдели утверждения,
+которые МОЖНО проверить по внешним источникам (люди, организации,
+события, даты, числа, адреса, URL, цитаты).
+
+ЗАПРЕЩЕНО включать:
+- общие мнения ("это важная тема")
+- перефразирование вопроса пользователя
+- утверждения без конкретики
+
+КРИТИЧНО про язык:
+- Пиши каждый claim НА ТОМ ЖЕ языке, на котором написано исходное
+  summary. Русский summary → русские claims. Английский → английские.
+- НЕ переводи на английский, НЕ транслитерируй имена.
+- Это обязательное условие для последующего сравнения с текстом
+  источников — любой перевод ломает attribution-проверку.
+
+Верни JSON: {"claims": [{"text": "...", "source_kind": "..."}]}
+Не более 6 claims. Формулируй каждый claim одним полным предложением.
+"""
+
+# Phase 12-5 — prompt for the attribution/grounding LLM (fact_check_model,
+# default mws/gpt-oss-20b). This is NOT a truth-check: we only verify that
+# each claim is traceable to a snippet that the subagent actually fetched.
+# "The source may itself be wrong" is explicitly out of scope — we're
+# catching subagent hallucinations, not auditing the internet.
+_VERDICT_PROMPT = """Ты — проверяющий attribution (а не истинности).
+Задача: для каждого утверждения определи, появляется ли оно в предоставленных
+snippets (текстах реально полученных URL). Ты НЕ оцениваешь, правда ли это —
+только взял ли субагент это из источника или выдумал.
+
+Правила:
+- grounded: утверждение (или его суть) явно присутствует в одном из snippets.
+            ОБЯЗАТЕЛЬНО укажи evidence_url из списка доказательств.
+- partial: в snippets есть только часть утверждения (тема/сущность совпадает,
+           но ключевые детали — имена, числа, даты — отсутствуют).
+           evidence_url можно указать, если совпадает тема.
+- ungrounded: ни одно из snippets не содержит это утверждение и не упоминает
+              его предмет. Источник не найден. evidence_url пустой.
+
+ВАЖНО:
+- Отсутствие утверждения в snippets — это ungrounded, а НЕ «ложь».
+  Мы НЕ знаем, правда это или нет — мы знаем только, что субагент это ниоткуда не взял.
+- НЕ выставляй grounded без evidence_url из списка доказательств.
+- НЕ используй внешние знания — только текст snippets.
+
+Утверждения пронумерованы как [1], [2], [3], ... В ответе обязательно укажи
+тот же номер в поле "index" — по нему мы связываем вердикт с утверждением.
+
+КРИТИЧНО: верни вердикт для КАЖДОГО утверждения из списка. Если в snippets
+нет ни одного упоминания — вердикт `ungrounded` с пустым evidence_url, это
+нормальный результат. Пустой объект {} или пустой список verdicts: [] —
+это ОШИБКА, так возвращать нельзя ни при каких условиях.
+
+Верни JSON строго в таком виде (N = число утверждений):
+{"verdicts": [
+  {"index": 1, "verdict": "grounded|partial|ungrounded", "evidence_url": "...", "reason": "..."},
+  {"index": 2, "verdict": "...", "evidence_url": "...", "reason": "..."},
+  ... до index = N
+]}
+Количество объектов в verdicts должно совпадать с числом утверждений.
+"""
+
+
 # ---------------------------------------------------------------------------
 # Pipe
 # ---------------------------------------------------------------------------
@@ -164,6 +291,53 @@ class Pipe:
         )
         enabled: bool = Field(default=True, description="Master switch.")
         debug: bool = Field(default=False, description="Verbose routing logs.")
+        # Phase 12 — FactChecker valves. The phase-1.5 fact-check stage runs
+        # after the main asyncio.gather dispatch and before _stream_aggregate,
+        # validating URLs and key claims from checkable subagents. See
+        # PLAN_truth_agent.md for the activation rules and cost model.
+        fact_check_enabled: bool = Field(
+            default=True,
+            description="Master switch for the phase-1.5 fact-check stage.",
+        )
+        fact_check_timeout: float = Field(
+            default=60.0,
+            description="Overall deadline (seconds) for the phase-1.5 attribution-check stage. 30s was not enough when the fallback retry to kimi-k2 fires on dense news snippets (primary gpt-oss-20b + kimi-k2 retry + URL validation + claim extraction all in the same budget). 60s covers the retry path without regressing the fast happy path.",
+        )
+        fact_check_max_urls: int = Field(
+            default=12,
+            description="Maximum number of URLs to validate per request.",
+        )
+        fact_check_max_claims: int = Field(
+            default=6,
+            description="Maximum number of claims to extract and verdict per request.",
+        )
+        fact_check_model: str = Field(
+            default="mws/gpt-oss-20b",
+            description="Model used to issue grounded/partial/ungrounded attribution verdicts.",
+        )
+        fact_check_claim_model: str = Field(
+            default="mws/gpt-oss-20b",
+            description="Cheap model used to extract checkable claims from summaries.",
+        )
+        fact_check_fallback_model: str = Field(
+            default="mws/kimi-k2",
+            description=(
+                "Stronger model used as retry when the primary verdict LLM "
+                "returns an empty JSON ({} or {\"verdicts\":[]}). gpt-oss-20b "
+                "sometimes gives up on dense news-homepage snippets; kimi-k2 "
+                "handles that kind of input better. Retry only fires on empty "
+                "— not on parse/truncation errors, which are already salvaged."
+            ),
+        )
+        fact_check_url_timeout: float = Field(
+            default=15.0,
+            description=(
+                "Per-URL read timeout (seconds) inside _validate_urls. Was 6s "
+                "— bumped to 15s to match _fetch_url_text so slow sites "
+                "(Cloudflare challenges, geo latency) don't falsely come back "
+                "as url_unreachable when the web_search subagent had read them fine."
+            ),
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -207,7 +381,7 @@ class Pipe:
                 f"[mws-auto {trace_id[:8]}] plan={[(t.kind, t.model) for t in plan]}"
             )
 
-        yield self._format_routing_block(plan, detected)
+        yield self._format_routing_block(plan, detected, include_verifier=True)
 
         results = await self._dispatch(plan, trace_id=trace_id)
 
@@ -215,6 +389,16 @@ class Pipe:
         results = await self._maybe_reclassify_stt(
             results, detected, messages, trace_id=trace_id, user_id=user_id
         )
+
+        if self._should_fact_check(plan, detected):
+            try:
+                user_q = detected.last_user_text or ""
+                fc = await self._sa_fact_check(results, detected, user_q)
+                results.append(fc)
+                if self.valves.debug:
+                    print(f"[mws-auto {trace_id[:8]}] fact_check done: {fc.summary}")
+            except Exception as e:
+                print(f"fact_check phase FAILED: {type(e).__name__}: {e}")
 
         final_model = (
             self.valves.default_ru_model
@@ -246,6 +430,19 @@ class Pipe:
         artifact_md = self._render_artifacts(results)
         if artifact_md:
             yield "\n\n" + artifact_md
+
+        fc = next((r for r in results if r.kind == "fact_check"), None)
+        if fc:
+            if fc.error:
+                yield (
+                    "\n\n<details>\n<summary>⚠️ Проверка реальности источников</summary>\n\n"
+                    f"Проверка не выполнена: `{fc.error}`.\n\n</details>"
+                )
+            else:
+                report = (fc.metadata or {}).get("report") or {}
+                details_md = self._render_fact_check_details(report)
+                if details_md:
+                    yield details_md
 
     # ------------------------------------------------------------------
     # Detector (rules, synchronous)
@@ -1131,20 +1328,617 @@ class Pipe:
     # ------------------------------------------------------------------
 
     def _format_routing_block(
-        self, plan: list[SubTask], detected: DetectedInput
+        self,
+        plan: list[SubTask],
+        detected: DetectedInput,
+        include_verifier: bool = False,
     ) -> str:
         subagents = [t.kind for t in plan]
         models = [t.model or "-" for t in plan]
+        verifier_line = ""
+        if include_verifier and self._should_fact_check(plan, detected):
+            verifier_line = f"- **Verifiers:** `['fact_check']`\n"
         return (
             "<details>\n<summary>🎯 Routing decision</summary>\n\n"
             f"- **Lang:** `{detected.lang}`\n"
             f"- **Subagents:** `{subagents}`\n"
+            f"{verifier_line}"
             f"- **Models:** `{models}`\n"
             f"- **Signals:** image={detected.has_image}, audio={detected.has_audio}, "
             f"doc={detected.has_document}, urls={len(detected.urls)}, "
             f"img_gen={detected.wants_image_gen}, web_search={detected.wants_web_search}\n"
             "\n</details>\n\n"
         )
+
+    @staticmethod
+    def _format_fact_check_for_prompt(report: dict) -> str:
+        urls = report.get("urls", []) or []
+        claims = report.get("claims", []) or []
+        # If we have no claims to label, inject nothing — otherwise the
+        # aggregator reads "use ✅/⚠️ labels" and sprinkles symbols randomly
+        # through the answer with no report to back them up.
+        if not claims:
+            return ""
+        ok = sum(1 for u in urls if u.get("status") in ("url_ok", "url_redirect"))
+        broken = sum(1 for u in urls if u.get("status") in ("url_404", "url_unreachable"))
+        lines = [
+            "--- ATTRIBUTION REPORT ---",
+            "Это проверка atribution: есть ли каждое утверждение в реально "
+            "полученных snippets источников. Это НЕ оценка истинности — источник "
+            "может и сам ошибаться; мы ловим только галлюцинации субагентов.",
+            f"URLs checked: {ok} ok, {broken} broken, {len(urls)} total.",
+            "Claims:",
+        ]
+        emoji = {"grounded": "✅", "partial": "⚠️", "ungrounded": "⚠️", "unknown": "⚠️"}
+        for c in claims:
+            tag = emoji.get(c.get("verdict", "unknown"), "⚠️")
+            ev = f" — via {c['evidence_url']}" if c.get("evidence_url") else ""
+            lines.append(f"  {tag} «{c.get('text','')}»{ev}")
+        lines.append("---")
+        lines.append(
+            "Инструкции для ответа:\n"
+            "1. СТАВЬ только символ ✅ или ⚠️ сразу после соответствующего "
+            "утверждения, БЕЗ пробела перед ним и БЕЗ скобок.\n"
+            "2. ЗАПРЕЩЕНО словами описывать характер проверки. Не пиши "
+            "«подтверждено», «не подтверждено», «отмечено как недостоверное», "
+            "«по данным источников», «согласно проверке» и т.п. — метки "
+            "говорят сами за себя.\n"
+            "3. ЗАПРЕЩЕНО утверждать, что какая-то информация ложная или "
+            "фейковая — мы проверяем только attribution, а не истинность.\n"
+            "4. Утверждения с ⚠️ можно смягчить формулировкой («сообщается», "
+            "«встречается в одном источнике») — но БЕЗ отдельного комментария "
+            "про проверку.\n"
+            "5. Отвечай пользователю своим обычным языком; метки ✅/⚠️ — "
+            "единственное видимое следствие этой проверки."
+        )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _render_fact_check_details(report: dict) -> str:
+        claims = report.get("claims", []) or []
+        urls = report.get("urls", []) or []
+        bad_urls = [u for u in urls if u.get("status") in ("url_404", "url_unreachable")]
+        # Suppress the block entirely when there's nothing actionable to show
+        # (no claims extracted and no broken URLs) — a silent pass is better
+        # than a noisy empty block.
+        if not claims and not bad_urls:
+            return ""
+        emoji_map = {"grounded": "✅", "partial": "⚠️", "ungrounded": "⚠️", "unknown": "⚠️"}
+        label_ru = {
+            "grounded": "есть в источнике",
+            "partial": "частично в источнике",
+            "ungrounded": "нет в источниках",
+            "unknown": "не определено",
+        }
+        rows = []
+        for c in claims:
+            v = c.get("verdict", "unknown")
+            em = emoji_map.get(v, "⚠️")
+            lab = label_ru.get(v, v)
+            line = f"- {em} **{lab}** — {c.get('text','')}"
+            if c.get("evidence_url"):
+                line += f"  \n  ↳ {c['evidence_url']}"
+            rows.append(line)
+        bad_lines = [f"- 🚫 {u.get('url')} ({u.get('status')})" for u in bad_urls]
+        parts: list[str] = []
+        if rows:
+            parts.append("\n".join(rows))
+        if bad_lines:
+            parts.append("**Недоступные URL:**\n" + "\n".join(bad_lines))
+        body = "\n\n".join(parts)
+        # Heading emoji must match the worst-case content inside the block.
+        # ✅ only when every claim is grounded AND every URL resolved; any
+        # broken URL or non-grounded claim downgrades the heading to ⚠️, so
+        # the user doesn't have to open the block to know something went off.
+        all_grounded = bool(claims) and all(
+            c.get("verdict") == "grounded" for c in claims
+        )
+        head_em = "✅" if all_grounded and not bad_urls else "⚠️"
+        return (
+            f"\n\n<details>\n<summary>{head_em} Проверка реальности источников</summary>\n\n"
+            f"{body}\n\n</details>"
+        )
+
+    # ------------------------------------------------------------------
+    # Phase 12 — URL validator (SSRF-hardened, async)
+    # ------------------------------------------------------------------
+
+    # Strip <script>/<style> bodies and all HTML tags, then collapse
+    # whitespace — otherwise the verdict LLM receives HTML soup where
+    # "+5 °C" lives inside <span class="temp">+5</span> markup and is
+    # impossible to match against a plain-Russian claim. We keep a generous
+    # 16 KB text window by default because weather/news pages front-load
+    # ~8–12 KB of nav/markup before the real forecast table.
+    _HTML_SCRIPT_RE = re.compile(
+        r"<script[^>]*>.*?</script>|<style[^>]*>.*?</style>",
+        re.DOTALL | re.IGNORECASE,
+    )
+    _HTML_TAG_RE = re.compile(r"<[^>]+>")
+    _HTML_WS_RE = re.compile(r"\s+")
+
+    @classmethod
+    def _html_to_text(cls, body: str, limit: int = 16384) -> str:
+        if not body:
+            return ""
+        body = cls._HTML_SCRIPT_RE.sub(" ", body)
+        text = cls._HTML_TAG_RE.sub(" ", body)
+        text = cls._HTML_WS_RE.sub(" ", text).strip()
+        return text[:limit]
+
+    @staticmethod
+    def _salvage_json_array(content: str, array_key: str) -> dict:
+        """Best-effort repair for truncated JSON from gpt-oss-20b in JSON mode.
+
+        When `max_tokens` still gets exceeded, the model returns something like
+        ``{"verdicts": [{"index":1,...}, {"index":2,"reason":"some long rea``
+        (no closing quote, no `]`, no `}`). `json.loads` dies with
+        "Unterminated string". We walk the string and keep all fully-closed
+        objects inside the target array, then reassemble a valid JSON.
+
+        Returns `{array_key: [...]}` with everything we could recover, or an
+        empty dict if nothing is salvageable."""
+        if not content or array_key not in content:
+            return {}
+        start = content.find("[", content.find(array_key))
+        if start < 0:
+            return {}
+        depth = 0
+        in_str = False
+        esc = False
+        last_good = -1
+        for i in range(start, len(content)):
+            ch = content[i]
+            if esc:
+                esc = False
+                continue
+            if ch == "\\":
+                esc = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    last_good = i
+            elif ch == "]" and depth == 0:
+                last_good = i
+                break
+        if last_good < 0:
+            return {}
+        head = content[start : last_good + 1]
+        # If we stopped on `}` (not `]`), close the array manually.
+        if not head.rstrip().endswith("]"):
+            head = head + "]"
+        try:
+            arr = json.loads(head)
+        except json.JSONDecodeError:
+            return {}
+        return {array_key: arr}
+
+    _CLAIM_NORM_RE = re.compile(r"[^\w\s]+", re.UNICODE)
+
+    @classmethod
+    def _norm_claim(cls, text: str) -> str:
+        """Normalize claim text for fallback-join with verdict entries that
+        omit the `index` field: lowercase + strip punctuation + collapse
+        whitespace + truncate to 120 chars. Makes the text-based lookup
+        immune to trailing dots, capitalization, and inserted spaces."""
+        if not text:
+            return ""
+        t = cls._CLAIM_NORM_RE.sub(" ", text.lower())
+        t = cls._HTML_WS_RE.sub(" ", t).strip()
+        return t[:120]
+
+    @staticmethod
+    def _dedupe_urls(
+        results: list[CompactResult], max_urls: int
+    ) -> tuple[list[str], dict[str, str]]:
+        """Collect a deduplicated list of URLs from subagent results, plus a
+        prefetched-bodies map. Respects the SSRF blocklist and the global
+        max_urls cap.
+
+        Attribution-correctness rule: if a subagent populated
+        ``metadata["fetched_urls"]`` — the subset of citations whose page body
+        the subagent actually read (not just pulled from a DDG snippet) — use
+        ONLY those. A URL the agent didn't fetch is not a real source and must
+        not feed the attribution check. Otherwise fall back to the previous
+        behaviour (citations + URLs scraped from the summary text).
+
+        When a result also carries ``metadata["fetched_bodies"]`` (a dict of
+        url → page text already pulled by _fetch_url_text), that text is
+        returned in the second element. _validate_urls uses it to skip the
+        network round-trip entirely for these URLs — which is the only way to
+        stop anti-bot sites (gismeteo, cloudflare-fronted pages) from
+        responding OK to the first request and TCP-RST'ing the second."""
+        seen: set[str] = set()
+        ordered: list[str] = []
+        prefetched: dict[str, str] = {}
+        for r in results:
+            meta = r.metadata or {}
+            fetched = meta.get("fetched_urls")
+            bodies = meta.get("fetched_bodies") or {}
+            if fetched is not None:
+                pool = list(fetched)
+            else:
+                pool = list(r.citations) + _URL_RE.findall(r.summary or "")
+            for u in pool:
+                u = u.rstrip(").,;:]»\"'")
+                if u and u not in seen and not _SSRF_BLOCK_RE.match(u):
+                    seen.add(u)
+                    ordered.append(u)
+                    body = bodies.get(u)
+                    if body:
+                        prefetched[u] = body
+                    if len(ordered) >= max_urls:
+                        return ordered, prefetched
+        return ordered, prefetched
+
+    async def _validate_urls(
+        self,
+        urls: list[str],
+        prefetched: Optional[dict[str, str]] = None,
+    ) -> list[UrlStatus]:
+        """Parallel URL validator with SSRF guard and aggressive timeouts.
+
+        If ``prefetched[u]`` already contains the page text (pulled earlier by
+        _sa_web_search / _sa_deep_research via _fetch_url_text), we skip the
+        network round-trip and return url_ok with that snippet. This is the
+        fix for the gismeteo.ru / world-weather.ru class of bugs: some sites
+        respond 200 to the first request from the search stage and then TCP-
+        RST / 403 the validator's second request a second later, causing the
+        same URL to end up both in the search summary AND in the
+        "Недоступные URL" list.
+
+        Uses GET (not HEAD) with a browser-like User-Agent for URLs we still
+        need to fetch: many sites return 403/405/timeout on HEAD from a
+        no-UA bot, and we'd falsely mark them url_unreachable. GET costs
+        slightly more bandwidth but the 2 KB slice plus read cap bounds the
+        hit. follow_redirects=True because we care about the final page
+        content for attribution.
+
+        Categories: url_ok / url_404 / url_auth_required / url_unreachable
+        / url_blocked_ssrf. 401/403 are treated as url_auth_required
+        (bot-gated but live), not broken links."""
+        prefetched = prefetched or {}
+        sem = asyncio.Semaphore(8)
+        timeout = httpx.Timeout(
+            self.valves.fact_check_url_timeout, connect=5.0
+        )
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "*/*;q=0.8"
+            ),
+            "Accept-Language": "ru,en;q=0.9",
+        }
+
+        async def one(client: httpx.AsyncClient, u: str) -> UrlStatus:
+            if _SSRF_BLOCK_RE.match(u):
+                return UrlStatus(u, "url_blocked_ssrf")
+            pre = prefetched.get(u)
+            if pre:
+                return UrlStatus(u, "url_ok", 200, u, pre[:16384])
+            async with sem:
+                try:
+                    r = await client.get(u)
+                    code = r.status_code
+                    final = str(r.url) if str(r.url) != u else u
+                    if code in (401, 403):
+                        return UrlStatus(u, "url_auth_required", code, final)
+                    if 400 <= code < 500:
+                        return UrlStatus(u, "url_404", code, final)
+                    if code >= 500:
+                        return UrlStatus(u, "url_unreachable", code, final)
+                    snippet = self._html_to_text(r.text or "", limit=16384)
+                    return UrlStatus(u, "url_ok", code, final, snippet)
+                except httpx.ConnectError:
+                    return UrlStatus(u, "url_unreachable", None, error="connect")
+                except httpx.TimeoutException:
+                    return UrlStatus(u, "url_unreachable", None, error="timeout")
+                except Exception as e:
+                    return UrlStatus(
+                        u, "url_unreachable", None, error=f"{type(e).__name__}"
+                    )
+
+        async with httpx.AsyncClient(
+            timeout=timeout, follow_redirects=True, http2=False, headers=headers
+        ) as client:
+            return await asyncio.gather(*[one(client, u) for u in urls])
+
+    # ------------------------------------------------------------------
+    # Phase 12-4 — claim extractor (LLM)
+    # ------------------------------------------------------------------
+
+    async def _extract_claims(
+        self,
+        results: list[CompactResult],
+        user_question: str,
+    ) -> list[Claim]:
+        """Extract up to `fact_check_max_claims` verifiable claims from the
+        summaries of checkable subagents. Returns [] on empty input or LLM
+        failure — never raises. Temperature is held at 0 for determinism."""
+        checkable = [
+            r for r in results
+            if r.kind in _CHECKABLE_KINDS and not r.error and r.summary
+        ]
+        if not checkable:
+            return []
+
+        lines = [f"Вопрос пользователя: {user_question[:500]}"]
+        for r in checkable:
+            lines.append(f"--- {r.kind} ---\n{r.summary[:1500]}")
+        user_msg = "\n\n".join(lines)
+
+        content = ""
+        try:
+            resp = await self._call_litellm(
+                model=self.valves.fact_check_claim_model,
+                messages=[
+                    {"role": "system", "content": _CLAIM_EXTRACT_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                temperature=0,
+                max_tokens=1500,
+                response_format={"type": "json_object"},
+            )
+            content = (
+                resp.get("choices", [{}])[0].get("message", {}).get("content")
+                or "{}"
+            )
+            try:
+                data = json.loads(content)
+            except json.JSONDecodeError:
+                data = self._salvage_json_array(content, "claims") or {}
+                if not data:
+                    raise
+        except Exception as e:
+            print(
+                f"fact_check claim_extract FAILED: {type(e).__name__}: {e} | "
+                f"content_head={content[:200]!r}"
+            )
+            return []
+
+        raw = (data.get("claims") or [])[: self.valves.fact_check_max_claims]
+        out: list[Claim] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text", "")).strip()
+            if len(text) < 10:
+                continue
+            src = str(item.get("source_kind", "")).strip() or "web_search"
+            out.append(Claim(text=text, source_kind=src))
+        return out
+
+    # ------------------------------------------------------------------
+    # Phase 12-5 — verdict LLM
+    # ------------------------------------------------------------------
+
+    async def _verdict_claims(
+        self,
+        claims: list[Claim],
+        url_statuses: list[UrlStatus],
+        user_question: str,
+    ) -> list[Claim]:
+        """Assign grounded/partial/ungrounded/unknown attribution verdicts to
+        each claim based on whether the snippets of validated URLs contain it.
+        This is NOT a truth-check — we only detect subagent hallucinations
+        (claims not traceable to any fetched source). Hallucinated "grounded"
+        verdicts (evidence_url not present in the url_ok set) are downgraded
+        to "ungrounded" and the URL is cleared. On LLM failure every claim
+        returns with verdict="unknown" and reason="verdict_llm_failed" — the
+        pipe must never crash here."""
+        if not claims:
+            return []
+
+        evidence_lines: list[str] = []
+        url_ok_set: set[str] = set()
+        for us in url_statuses:
+            if us.status in ("url_ok", "url_redirect") and us.snippet:
+                ref = us.final_url or us.url
+                # Feed ~4 KB of cleaned text per URL. Snippets arrive already
+                # HTML-stripped from _validate_urls, so the LLM sees plain text
+                # with forecast tables and news headlines intact. Keeps total
+                # input bounded so the JSON output (verdicts with reason +
+                # evidence_url per claim) fits into max_tokens=2500 without
+                # tail truncation. Was 8000 → regularly blew the budget and
+                # json.loads failed with "Unterminated string".
+                evidence_lines.append(
+                    f"URL: {ref}\nSnippet: {us.snippet[:4000]}"
+                )
+                url_ok_set.add(ref)
+            elif us.status in ("url_404", "url_unreachable"):
+                evidence_lines.append(
+                    f"URL: {us.url} — НЕДОСТУПЕН ({us.status})"
+                )
+        evidence_text = (
+            "\n\n".join(evidence_lines) if evidence_lines else "(нет доказательств)"
+        )
+
+        claims_text = "\n".join(
+            f"[{i}] {c.text}" for i, c in enumerate(claims, start=1)
+        )
+        user_msg = (
+            f"Вопрос пользователя: {user_question[:500]}\n\n"
+            f"Утверждения для проверки (нумерация обязательна в ответе):\n{claims_text}\n\n"
+            f"Доказательства:\n{evidence_text}"
+        )
+
+        async def _one_attempt(model: str) -> tuple[dict, str]:
+            """Single verdict-LLM call. Returns (parsed_data, raw_content).
+            Never raises — on any error returns ({}, content)."""
+            content = ""
+            try:
+                resp = await self._call_litellm(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": _VERDICT_PROMPT},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    temperature=0,
+                    max_tokens=2500,
+                    response_format={"type": "json_object"},
+                )
+                content = (
+                    resp.get("choices", [{}])[0].get("message", {}).get("content")
+                    or "{}"
+                )
+                try:
+                    return json.loads(content), content
+                except json.JSONDecodeError:
+                    salvaged = self._salvage_json_array(content, "verdicts") or {}
+                    return salvaged, content
+            except Exception as e:
+                print(
+                    f"fact_check verdict FAILED ({model}): {type(e).__name__}: {e} | "
+                    f"content_head={content[:200]!r}"
+                )
+                return {}, content
+
+        data, content = await _one_attempt(self.valves.fact_check_model)
+        verdicts = (data or {}).get("verdicts") or []
+
+        # Retry with the stronger fallback model if the primary returned an
+        # empty object or empty verdicts list. gpt-oss-20b sometimes "gives
+        # up" on dense homepage snippets (/world/, /rubric/mir) and emits
+        # `{}` — kimi-k2 handles that kind of input better. Skipped when the
+        # primary already errored out with json_failed (no sense burning a
+        # second call if the first didn't even parse).
+        fallback_model = self.valves.fact_check_fallback_model
+        if not verdicts and fallback_model and fallback_model != self.valves.fact_check_model:
+            print(
+                f"fact_check verdict retry: primary={self.valves.fact_check_model} "
+                f"returned empty, falling back to {fallback_model} | "
+                f"user_msg_head={user_msg[:300]!r}"
+            )
+            # Hard cap on the retry — kimi-k2 on dense news snippets can hang
+            # long enough to consume the whole fact_check_timeout budget and
+            # turn the entire phase into `error=timeout`, losing even the
+            # primary's result. Wrap the retry in its own deadline so we fail
+            # fast and still render the trailing details block with whatever
+            # verdicts we have (or with `unknown` for all of them).
+            try:
+                data2, content2 = await asyncio.wait_for(
+                    _one_attempt(fallback_model), timeout=25.0
+                )
+            except asyncio.TimeoutError:
+                print(
+                    f"fact_check verdict retry TIMEOUT ({fallback_model}) after 25s"
+                )
+                data2, content2 = {}, ""
+            verdicts2 = (data2 or {}).get("verdicts") or []
+            if verdicts2:
+                data, content, verdicts = data2, content2, verdicts2
+
+        # If BOTH primary and fallback failed to parse/return anything, surface
+        # the whole thing as verdict_llm_failed.
+        if data is None:
+            data = {}
+        if not verdicts and not data:
+            print(
+                f"fact_check verdict BOTH FAILED | content_head={content[:200]!r}"
+            )
+            return [
+                Claim(
+                    text=c.text,
+                    source_kind=c.source_kind,
+                    verdict="unknown",
+                    reason="verdict_llm_failed",
+                )
+                for c in claims
+            ]
+        # Primary join is by `index` (as required by _VERDICT_PROMPT), but
+        # gpt-oss-20b sometimes ignores that instruction and returns the older
+        # shape `{"claim": "...", "verdict": "..."}`. Build a second by-text
+        # index as a fallback so we don't silently default everything to
+        # "unknown" on prompt drift.
+        by_index: dict[int, dict] = {}
+        by_text: dict[str, dict] = {}
+        unmatched: list[dict] = []
+        for v in verdicts:
+            if not isinstance(v, dict):
+                continue
+            placed = False
+            raw_idx = v.get("index")
+            if raw_idx is not None:
+                try:
+                    idx = int(raw_idx)
+                except (TypeError, ValueError):
+                    idx = 0
+                if 1 <= idx <= len(claims):
+                    by_index[idx] = v
+                    placed = True
+            txt_key = self._norm_claim(str(v.get("claim", "")))
+            if txt_key:
+                by_text.setdefault(txt_key, v)
+                placed = True
+            if not placed:
+                unmatched.append(v)
+
+        # Positional fallback: if the LLM returned verdicts in the same order
+        # but without index/claim fields, drain unmatched into remaining slots.
+        leftovers = list(unmatched)
+
+        out: list[Claim] = []
+        matched_count = 0
+        for i, c in enumerate(claims, start=1):
+            v = by_index.get(i)
+            if v is None:
+                v = by_text.get(self._norm_claim(c.text))
+            if v is None and leftovers:
+                v = leftovers.pop(0)
+            if v is None:
+                v = {}
+            else:
+                matched_count += 1
+            verdict = str(v.get("verdict", "unknown")).lower().strip()
+            if verdict not in ("grounded", "partial", "ungrounded"):
+                verdict = "unknown"
+            ev_url = str(v.get("evidence_url", "")).strip() or None
+            # Critical guard: grounded without a real URL from the ok-set is
+            # a hallucination by the verdict LLM itself — downgrade to
+            # ungrounded and clear the URL.
+            if verdict == "grounded" and (not ev_url or ev_url not in url_ok_set):
+                verdict = "ungrounded"
+                ev_url = None
+            out.append(
+                Claim(
+                    text=c.text,
+                    source_kind=c.source_kind,
+                    verdict=verdict,
+                    evidence_url=ev_url,
+                    reason=str(v.get("reason", "")).strip()[:300],
+                )
+            )
+        # Visibility: distinguish the two silent-failure modes so we can see
+        # *why* every claim might come back as "unknown".
+        #   - verdicts list empty → LLM returned {} or {"verdicts":[]} (did
+        #     not even try to label claims; usually a prompt/model issue).
+        #   - verdicts present but nothing joined → shape drift (wrong
+        #     indices, missing claim text, wrong field names).
+        if not verdicts:
+            print(
+                "fact_check verdict EMPTY VERDICTS: "
+                f"claims={len(claims)} urls_ok={len(url_ok_set)} "
+                f"raw_data={str(data)[:400]}"
+            )
+        elif matched_count == 0:
+            print(
+                "fact_check verdict JOIN EMPTY: "
+                f"claims={len(claims)} verdicts={len(verdicts)} "
+                f"raw={str(verdicts)[:400]}"
+            )
+        return out
 
     # ------------------------------------------------------------------
     # LiteLLM HTTP helpers
@@ -1317,9 +2111,11 @@ class Pipe:
         detected: DetectedInput,
         trace_id: str,
     ) -> AsyncGenerator[str, None]:
+        fc_result = next((r for r in results if r.kind == "fact_check"), None)
+        checkable_results = [r for r in results if r.kind != "fact_check"]
         # Build scratchpad from compact summaries only
         lines: list[str] = []
-        for r in results:
+        for r in checkable_results:
             if r.error:
                 lines.append(f"[sa_{r.kind}] (ошибка: {r.error})")
                 continue
@@ -1388,6 +2184,17 @@ class Pipe:
             f"{memory_block}"
             f"\n\n--- SUBAGENT RESULTS ---\n{scratchpad}"
         )
+
+        # NOTE: we deliberately do NOT inject the attribution report into the
+        # aggregator's system prompt. When we did, the LLM sprinkled ✅/⚠️
+        # through the answer without any real mapping to verdicts — it just
+        # pattern-matched "use these labels" and decorated every bullet with
+        # ✅ even when the details block said everything was ungrounded. The
+        # per-claim attribution now lives exclusively in the trailing
+        # <details>Проверка реальности источников</details> block emitted by
+        # pipe() via _render_fact_check_details. The aggregator writes the
+        # answer unaware of fact_check; the user gets a clean body plus an
+        # independent audit section with no inline contradictions.
 
         # Pass conversation history so the aggregator understands context
         # (e.g. "translate previous answer", "now in Russian", follow-ups)
@@ -1947,13 +2754,17 @@ class Pipe:
 
         async def _safe_fetch(u: str) -> str:
             try:
-                return (await self._fetch_url_text(u))[:2000]
+                return await self._fetch_url_text(u)
             except Exception:
                 return ""
 
         bodies = await asyncio.gather(*[_safe_fetch(h["url"]) for h in hits])
+        fetched_urls = [h["url"] for h, body in zip(hits, bodies) if body]
+        fetched_bodies = {
+            h["url"]: body for h, body in zip(hits, bodies) if body
+        }
         snippets_block = "\n\n".join(
-            f"[{i+1}] {h['title']} — {h['url']}\n{body or h['snippet']}"
+            f"[{i+1}] {h['title']} — {h['url']}\n{(body[:2000] if body else h['snippet'])}"
             for i, (h, body) in enumerate(zip(hits, bodies))
         )
         lang_hint = (
@@ -1985,6 +2796,10 @@ class Pipe:
             kind="web_search",
             summary=self._truncate_tokens(text, 500),
             citations=[h["url"] for h in hits],
+            metadata={
+                "fetched_urls": fetched_urls,
+                "fetched_bodies": fetched_bodies,
+            },
         )
 
     # ------------------------------------------------------------------
@@ -2273,15 +3088,19 @@ class Pipe:
         # Step 3 — fetch page bodies in parallel (best-effort; snippet fallback).
         async def _safe_fetch(u: str) -> str:
             try:
-                return (await self._fetch_url_text(u))[:2500]
+                return await self._fetch_url_text(u)
             except Exception:
                 return ""
 
         bodies = await asyncio.gather(
             *[_safe_fetch(h["url"]) for h in all_hits]
         )
+        fetched_urls = [h["url"] for h, body in zip(all_hits, bodies) if body]
+        fetched_bodies = {
+            h["url"]: body for h, body in zip(all_hits, bodies) if body
+        }
         context_block = "\n\n".join(
-            f"[{i+1}] {h['title']} — {h['url']}\n{body or h.get('snippet','')}"
+            f"[{i+1}] {h['title']} — {h['url']}\n{(body[:2500] if body else h.get('snippet',''))}"
             for i, (h, body) in enumerate(zip(all_hits, bodies))
         )
         sub_queries_block = "\n".join(f"- {q}" for q in sub_queries)
@@ -2340,7 +3159,12 @@ class Pipe:
             kind="deep_research",
             summary=self._truncate_tokens(text, 700),
             citations=[h["url"] for h in all_hits],
-            metadata={"sub_queries": sub_queries, "sources": len(all_hits)},
+            metadata={
+                "sub_queries": sub_queries,
+                "sources": len(all_hits),
+                "fetched_urls": fetched_urls,
+                "fetched_bodies": fetched_bodies,
+            },
         )
 
     # ------------------------------------------------------------------
@@ -2540,3 +3364,85 @@ class Pipe:
                 summary=prefix + f"(не удалось сгенерировать план: {e})",
                 error=reason,
             )
+
+    # ------------------------------------------------------------------
+    # Phase 12 — FactChecker subagent (skeleton)
+    # ------------------------------------------------------------------
+    # These are stubs so the pipe loads; real implementations land in
+    # phase-12-4 .. phase-12-8. Wiring from pipe() / _stream_aggregate is
+    # intentionally NOT added here — that happens in phase-12-7 and 12-8.
+
+    def _should_fact_check(
+        self, plan: list[SubTask], detected: DetectedInput
+    ) -> bool:
+        if not self.valves.fact_check_enabled:
+            return False
+        if _FACT_CHECK_TRIGGER_RE.search(detected.last_user_text or ""):
+            return True
+        kinds = {t.kind for t in plan}
+        return bool(kinds & _CHECKABLE_KINDS)
+
+    async def _sa_fact_check(
+        self,
+        results: list[CompactResult],
+        detected: DetectedInput,
+        user_question: str,
+    ) -> CompactResult:
+        """Phase-1.5 orchestrator: dedupe URLs → validate + extract claims in
+        parallel → verdict claims. Returns a CompactResult with the full
+        FactCheckReport under metadata["report"]."""
+        checkable = [
+            r for r in results
+            if r.kind in _CHECKABLE_KINDS and not r.error
+        ]
+        if not checkable:
+            return CompactResult(kind="fact_check", summary="nothing to check")
+
+        async def _do() -> FactCheckReport:
+            urls, prefetched = self._dedupe_urls(
+                checkable, self.valves.fact_check_max_urls
+            )
+            url_task = (
+                asyncio.create_task(self._validate_urls(urls, prefetched))
+                if urls
+                else None
+            )
+            claim_task = asyncio.create_task(self._extract_claims(checkable, user_question))
+            url_statuses = await url_task if url_task else []
+            claims = await claim_task
+            claims_with_verdict = await self._verdict_claims(claims, url_statuses, user_question)
+            return FactCheckReport(
+                urls=url_statuses,
+                claims=claims_with_verdict,
+                total_checked_kinds=sorted({r.kind for r in checkable}),
+            )
+
+        try:
+            report = await asyncio.wait_for(_do(), timeout=self.valves.fact_check_timeout)
+        except asyncio.TimeoutError:
+            return CompactResult(
+                kind="fact_check",
+                summary="fact-check timed out",
+                error="timeout",
+            )
+        except Exception as e:
+            print(f"fact_check FAILED: {type(e).__name__}: {e}")
+            return CompactResult(
+                kind="fact_check",
+                summary=f"fact-check failed: {type(e).__name__}",
+                error=str(e)[:200],
+            )
+
+        total = len(report.claims)
+        grounded = sum(1 for c in report.claims if c.verdict == "grounded")
+        ungrounded = sum(1 for c in report.claims if c.verdict == "ungrounded")
+        url_ok = sum(1 for u in report.urls if u.status in ("url_ok", "url_redirect"))
+        summary = (
+            f"attribution: {grounded}/{total} grounded, {ungrounded} ungrounded, "
+            f"URLs ok={url_ok}/{len(report.urls)}"
+        )
+        return CompactResult(
+            kind="fact_check",
+            summary=summary,
+            metadata={"report": asdict(report)},
+        )
